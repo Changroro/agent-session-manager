@@ -756,73 +756,29 @@ def test_title_falls_back_when_every_user_turn_is_a_preamble(claude_session, tmp
     assert plan.new[0].title == "답변"
 
 
-# --- Multiple Codex homes (one per account) ---
+# --- Single active Codex home ---
 
 
-def test_codex_homes_discovers_sibling_home(monkeypatch, tmp_path):
-    from asm import models
-
-    home = tmp_path / "home"
-    (home / ".codex" / "sessions").mkdir(parents=True)
-    (home / ".codex-work" / "sessions").mkdir(parents=True)
-    (home / ".codex-nosessions").mkdir()
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.setattr(models, "CODEX_DIR", home / ".codex")
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    monkeypatch.delenv("ASM_CODEX_HOMES", raising=False)
-
-    homes = models.codex_homes()
-
-    assert homes == [home / ".codex", home / ".codex-work"]
-
-
-def test_asm_codex_homes_env_wins_over_discovery(monkeypatch, tmp_path):
-    import os
-
-    from asm import models
-
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    monkeypatch.setenv("ASM_CODEX_HOMES", os.pathsep.join([str(tmp_path / "a"), str(tmp_path / "b")]))
-
-    assert models.codex_homes() == [tmp_path / "a", tmp_path / "b"]
-
-
-def test_set_codex_homes_overrides_everything(monkeypatch, tmp_path):
-    from asm import models
-
-    monkeypatch.setenv("ASM_CODEX_HOMES", str(tmp_path / "ignored"))
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    models.set_codex_homes([str(tmp_path / "picked")])
-    try:
-        assert models.codex_homes() == [tmp_path / "picked"]
-    finally:
-        models.set_codex_homes(None)
-
-
-def test_rollouts_and_lookup_span_every_home(monkeypatch, tmp_path):
-    from asm import models
-
-    primary = tmp_path / ".codex"
-    second = tmp_path / ".codex-work"
-    for home, sid in ((primary, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-                      (second, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")):
-        target = home / "sessions" / "2026" / "08" / "05"
+def test_rollouts_ignore_sibling_legacy_home(monkeypatch, tmp_path):
+    active = tmp_path / ".codex" / "sessions"
+    legacy = tmp_path / ".codex-hermes" / "sessions"
+    active_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    legacy_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    for directory, sid in ((active, active_id), (legacy, legacy_id)):
+        target = directory / "2026" / "08" / "05"
         target.mkdir(parents=True)
         (target / f"rollout-2026-08-05T09-00-00-{sid}.jsonl").write_text(
             "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _rollout_rows()),
             encoding="utf-8",
         )
-    monkeypatch.setattr(models, "CODEX_DIR", primary)
-    monkeypatch.setattr(agent_import, "CODEX_SESSIONS_DIR", primary / "sessions")
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    monkeypatch.delenv("ASM_CODEX_HOMES", raising=False)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(agent_import, "CODEX_SESSIONS_DIR", active)
 
-    assert len(agent_import.codex_rollout_files()) == 2
-    found = agent_import.find_codex_rollout("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
-    assert found is not None and found.parents[4].name == ".codex-work"
-    assert agent_import.find_codex_rollout("no-such-id") is None
+    listed = agent_import.codex_rollout_files()
 
+    assert len(listed) == 1
+    assert active_id in listed[0].name
+    assert agent_import.find_codex_rollout(active_id) == listed[0]
+    assert agent_import.find_codex_rollout(legacy_id) is None
 
 def test_title_skips_hash_prefixed_preamble(claude_session):
     """A leading `# AGENTS.md ...` dump is injected context, not a label."""

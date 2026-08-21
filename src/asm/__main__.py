@@ -5,7 +5,6 @@ import sys
 
 from asm.cli import add_cli_subparsers, run_cli
 from asm.i18n import init_lang
-from asm import models
 from asm.models import migrate_legacy_data_dir
 
 
@@ -51,22 +50,12 @@ def main():
              "Both sources are always shown; toggle in-app with 's'.",
     )
     parser.add_argument(
-        "--codex-home",
-        action="append",
-        metavar="PATH",
-        help="Codex home dir to scan; repeat for multiple accounts. "
-             "Overrides ASM_CODEX_HOMES and auto-discovery.",
-    )
-    parser.add_argument(
         "--no-update-check",
         action="store_true",
         help="Skip the startup check for a newer release.",
     )
     add_cli_subparsers(parser)
     args = parser.parse_args()
-
-    if getattr(args, "codex_home", None):
-        models.set_codex_homes(args.codex_home)
 
     migrate_legacy_data_dir()
 

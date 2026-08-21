@@ -319,7 +319,7 @@ def list_empty_todo_entries() -> list[str]:
 
 
 def trash_codex_session(path: str | Path) -> bool:
-    """Move a Codex rollout session file to trash (validated under a Codex home)."""
+    """Move a Codex rollout session file to trash (validated under CODEX_HOME)."""
     p = Path(path)
     if not p.exists():
         return False
@@ -329,10 +329,7 @@ def trash_codex_session(path: str | Path) -> bool:
         resolved = p.resolve()
         from asm.services import codex_data
 
-        # Deletable range must equal the scanned range, or a session listed from
-        # a second account home could not be trashed.
-        roots = [d.resolve() for d in codex_data._session_dirs() if d.exists()]
-        if not any(resolved.is_relative_to(root) for root in roots):
+        if not resolved.is_relative_to(codex_data.CODEX_SESSIONS_DIR.resolve()):
             raise ValueError(f"Path outside Codex dir: {p}")
         create_recovery_snapshot(resolved, "codex-session")
         _log_trash(resolved, "codex-session")

@@ -70,7 +70,7 @@ same view filtered to **Claude** and to **Codex**:
 
 ### Claude ↔ Codex (`F8` tab)
 - **MCP servers, both ways:** compares `~/.codex/config.toml` with `~/.claude.json`, lists what only one side has, and adds it through that agent's own `mcp add` CLI (so file format and comments stay intact). Auth headers and env vars are carried over verbatim; `codex mcp add` can't express HTTP headers, so those are appended as `[mcp_servers.<name>.http_headers]`
-- **Sessions, both ways:** Claude transcripts become Codex rollout threads and vice versa — verified end-to-end by resuming the result in the real CLI. Claude→Codex writes the same `content_sha256` ledger the official importer uses, so it won't duplicate what Codex already imported, and unlike `/import` you pick the sessions (no 30-day / 50-session cap)
+- **Session copies, both ways:** Claude transcripts become Codex rollout threads and vice versa — verified end-to-end by resuming the result in the real CLI. Claude→Codex writes the same `content_sha256` ledger the official importer uses, so it won't duplicate what Codex already imported, and unlike `/import` you pick the sessions (no 30-day / 50-session cap)
 - Imported copies carry **zeroed token usage**, so a session that moved never gets priced twice
 - Everything is planned before it's written: a preview lists importable / skipped / unsupported items, and a backup snapshot is taken before the first write
 - **Nothing is preselected.** A plan covers the newest 200 transcripts (hashing every one of 25k+ rollouts would be slow) and states how many older ones it left out, so a truncated list never reads as "that's all of them"
@@ -173,8 +173,8 @@ asm import session <session-id>   # Move one session; direction inferred from th
 asm import mcp --to codex         # Move MCP servers between agents
 ```
 
-Signed into Codex with more than one account? Sessions land in a separate home
-per login — see [Multiple Codex accounts](docs/multiple-codex-accounts.md).
+Codex App, CLI, and companion agents share one session store — see
+[Codex data home](docs/codex-data-home.md).
 
 `asm import list` sorts by **last activity**, not by the timestamp in a Codex
 rollout filename (that one is when the session *started*), and prints that

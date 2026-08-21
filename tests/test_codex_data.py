@@ -148,56 +148,56 @@ class TestCodexModelDetection:
         assert set(periods[0]["models"]) == {codex_data.UNKNOWN_MODEL}
 
 
-# --- Multiple Codex homes (one per account) ---
+# --- Single active Codex home ---
 
 
-def test_scans_every_codex_home(monkeypatch, tmp_path):
-    from asm import models
+def test_scans_only_active_codex_home(monkeypatch, tmp_path):
     from asm.services import codex_data
 
-    primary = tmp_path / ".codex"
-    second = tmp_path / ".codex-work"
+    active = tmp_path / ".codex" / "sessions"
+    legacy = tmp_path / ".codex-hermes" / "sessions"
     _write_rollout_real_layout(
-        primary / "sessions" / "2026" / "06" / "01" / "rollout-2026-06-01T09-00-00-aaaa.jsonl",
-        "aaaa", "/work/a", ["gpt-5.5"],
-        {"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 10, "total_tokens": 110},
+        active / "2026" / "06" / "01" / "rollout-2026-06-01T09-00-00-aaaa.jsonl",
+        "aaaa", "/work/active", ["gpt-5.5"], None,
     )
     _write_rollout_real_layout(
-        second / "sessions" / "2026" / "06" / "02" / "rollout-2026-06-02T09-00-00-bbbb.jsonl",
-        "bbbb", "/work/b", ["gpt-5.5"],
-        {"input_tokens": 200, "cached_input_tokens": 0, "output_tokens": 20, "total_tokens": 220},
+        legacy / "2026" / "06" / "02" / "rollout-2026-06-02T09-00-00-bbbb.jsonl",
+        "bbbb", "/work/legacy", ["gpt-5.5"], None,
     )
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setattr(models, "CODEX_DIR", primary)
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    monkeypatch.delenv("ASM_CODEX_HOMES", raising=False)
-    monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", primary / "sessions")
+    monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", active)
     codex_data.refresh()
 
-    assert codex_data.is_available()
-    assert codex_data.total_session_count() == 2
-    assert {p.path for p in codex_data.get_projects()} == {"/work/a", "/work/b"}
-
-    codex_data.refresh()
-
-
-def test_repointed_sessions_dir_stays_pinned(monkeypatch, tmp_path):
-    """Tests (and --codex-home) pin one dir; discovery must not widen it."""
-    from asm import models
-    from asm.services import codex_data
-
-    pinned = tmp_path / "pinned"
-    _write_rollout_real_layout(
-        pinned / "2026" / "06" / "01" / "rollout-2026-06-01T09-00-00-cccc.jsonl",
-        "cccc", "/work/c", ["gpt-5.5"], None,
-    )
-    (tmp_path / ".codex-other" / "sessions" / "2026" / "06").mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setattr(models, "CODEX_DIR", tmp_path / ".codex")
-    monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", pinned)
-    codex_data.refresh()
-
-    assert codex_data._session_dirs() == [pinned]
     assert codex_data.total_session_count() == 1
+    assert [path.parent.parent.parent.parent.parent for path in codex_data._rollout_files()] == [active.parent]
+
+    codex_data.refresh()
+
+
+def test_ledger_query_excludes_rows_from_legacy_home(monkeypatch, tmp_path):
+    from asm import models
+    from asm.services import codex_data, ledger
+
+    active = tmp_path / ".codex" / "sessions"
+    legacy = tmp_path / ".codex-hermes" / "sessions"
+    _write_rollout_real_layout(
+        legacy / "2026" / "06" / "01" / "rollout-2026-06-01T09-00-00-cccc.jsonl",
+        "cccc", "/work/legacy", ["gpt-5.5"], None,
+    )
+    _write_rollout_real_layout(
+        active / "2026" / "06" / "02" / "rollout-2026-06-02T09-00-00-dddd.jsonl",
+        "dddd", "/work/active", ["gpt-5.5"], None,
+    )
+    monkeypatch.setattr(models, "APP_DATA_DIR", tmp_path / ".asm")
+
+    monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", legacy)
+    codex_data.refresh()
+    assert ledger.update_codex() == 1
+
+    monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", active)
+    codex_data.refresh()
+    projects = codex_data.get_projects()
+
+    assert [project.path for project in projects] == ["/work/active"]
+    assert len(ledger.codex_records()) == 2  # historical row retained, query scope filters it
 
     codex_data.refresh()

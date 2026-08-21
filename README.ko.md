@@ -69,7 +69,7 @@
 
 ### Claude ↔ Codex (`F8` 탭)
 - **MCP 서버 양방향:** `~/.codex/config.toml`과 `~/.claude.json`을 비교해 한쪽에만 있는 항목을 찾고, 각 에이전트의 `mcp add` CLI로 추가한다(파일 포맷·주석 보존). 인증 헤더와 env는 그대로 옮기며, `codex mcp add`가 HTTP 헤더를 표현하지 못해 그 부분만 `[mcp_servers.<name>.http_headers]`로 덧붙인다
-- **세션 양방향:** Claude 대화록 ↔ Codex rollout 스레드 변환 — 실제 CLI에서 resume해 맥락이 복원되는 것까지 확인했다. Claude→Codex는 공식 importer와 같은 `content_sha256` 원장에 기록해 Codex가 이미 가져온 세션을 중복 생성하지 않고, `/import`와 달리 원하는 세션만 고를 수 있다(30일·50개 제한 없음)
+- **세션 양방향 복사:** Claude 대화록 ↔ Codex rollout 스레드 변환 — 실제 CLI에서 resume해 맥락이 복원되는 것까지 확인했다. Claude→Codex는 공식 importer와 같은 `content_sha256` 원장에 기록해 Codex가 이미 가져온 세션을 중복 생성하지 않고, `/import`와 달리 원하는 세션만 고를 수 있다(30일·50개 제한 없음)
 - 가져온 사본은 **토큰 사용량이 0**으로 기록돼, 옮긴 세션이 두 번 과금 집계되지 않는다
 - 쓰기 전에 항상 계획을 먼저 보여준다: 가져올 수 있음 / 건너뜀 / 미지원 목록을 미리 확인하고, 첫 쓰기 전에 백업 스냅샷을 만든다
 - **기본 선택은 없다.** 계획은 최신 200개까지만 잡고(2.5만 개 rollout을 전부 해시하면 느리다), 제외된 오래된 개수를 함께 표시해 잘린 목록이 "이게 전부"로 읽히지 않게 한다
@@ -172,8 +172,8 @@ asm import session <session-id>   # 세션 1개 이동(방향은 id로 자동 �
 asm import mcp --to codex         # MCP 서버 이동
 ```
 
-Codex에 계정을 두 개 이상 쓰고 있다면 로그인마다 홈이 따로 생긴다 —
-[Codex 계정이 여러 개일 때](docs/multiple-codex-accounts.ko.md) 참고.
+Codex App·CLI·동반 에이전트는 세션 저장소 하나를 공유한다 —
+[Codex 데이터 홈](docs/codex-data-home.ko.md) 참고.
 
 `asm import list`는 **마지막 활동 시각** 기준으로 정렬한다 — Codex rollout 파일명의
 시각은 세션을 *시작한* 때라 순서가 다르게 보인다. 그래서 활동 시각을 함께 출력해

@@ -23,15 +23,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ko": "Claude Code와 Codex에서 옮길 수 있는 세션·MCP 서버를 스캔 중...",
     },
     "imp.header": {
-        "en": "{mode}  ·  {pending} movable, {selected} selected  ·  1-4: direction  ·  space: pick  ·  a: all/none  ·  i: move",
-        "ko": "{mode}  ·  옮길 수 있음 {pending}개, 선택 {selected}개  ·  1-4: 방향  ·  space: 선택  ·  a: 전체/해제  ·  i: 옮기기",
+        "en": "{mode}  ·  {pending} copyable, {selected} selected  ·  1-4: direction  ·  space: pick  ·  a: all/none  ·  i: copy",
+        "ko": "{mode}  ·  복사 가능 {pending}개, 선택 {selected}개  ·  1-4: 방향  ·  space: 선택  ·  a: 전체/해제  ·  i: 복사",
     },
-    "imp.new": {"en": "movable", "ko": "옮기기 가능"},
+    "imp.new": {"en": "copyable", "ko": "복사 가능"},
     "imp.skip": {"en": "skipped", "ko": "건너뜀"},
     "imp.nothing": {"en": "Nothing selected to import.", "ko": "가져올 항목이 선택되지 않았습니다."},
     "imp.confirm": {
-        "en": "Import {count} item(s) via {mode}? A backup snapshot is taken first.",
-        "ko": "{mode}(으)로 {count}개를 가져올까요? 먼저 백업 스냅샷을 만듭니다.",
+        "en": "Copy {count} item(s) via {mode}? The source stays in place; a backup snapshot is taken first.",
+        "ko": "{mode}(으)로 {count}개를 복사할까요? 원본은 유지되며 먼저 백업 스냅샷을 만듭니다.",
     },
     "imp.done": {
         "en": "Imported {imported}, failed {failed}",

@@ -27,8 +27,7 @@ def _validate_original_path(path: Path) -> Path:
     from asm.services import codex_data
 
     resolved = path.resolve()
-    codex_roots = [d.parent.resolve() for d in codex_data._session_dirs() if d.parent.exists()]
-    roots = (CLAUDE_DIR.resolve(), *codex_roots)
+    roots = (CLAUDE_DIR.resolve(), codex_data.CODEX_SESSIONS_DIR.parent.resolve())
     if not any(resolved.is_relative_to(root) for root in roots):
         raise ValueError(f"Recovery path outside managed data dirs: {path}")
     return resolved

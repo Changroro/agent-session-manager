@@ -447,3 +447,39 @@ def test_cli_import_session_requires_id(monkeypatch, capsys):
 def test_cli_import_session_not_found(import_env, monkeypatch, capsys):
     code, _out = _run(monkeypatch, capsys, "import", "session", "no-such-session")
     assert code == 1
+
+
+def test_cli_import_home_reports_single_active_home(monkeypatch, capsys, tmp_path: Path):
+    from asm import models
+    from asm.services import agent_import
+
+    home = tmp_path / ".codex"
+    sessions = home / "sessions" / "2026" / "08" / "05"
+    sessions.mkdir(parents=True)
+    (sessions / "rollout-2026-08-05T09-00-00-77777777-7777-4777-8777-777777777777.jsonl").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(models, "CODEX_DIR", home)
+    monkeypatch.setattr(models, "CODEX_SESSIONS_DIR", home / "sessions")
+    # cmd_import imports constants at call time from models.
+    code, out = _run(monkeypatch, capsys, "import", "home")
+
+    assert code == 0
+    assert str(home) in out
+    assert "1 sessions" in out
+
+
+def test_cli_import_home_json(monkeypatch, capsys, tmp_path: Path):
+    from asm import models
+
+    home = tmp_path / ".codex"
+    home.mkdir()
+    monkeypatch.setattr(models, "CODEX_DIR", home)
+    monkeypatch.setattr(models, "CODEX_SESSIONS_DIR", home / "sessions")
+
+    code, out = _run(monkeypatch, capsys, "import", "home", "--json")
+
+    assert code == 0
+    assert json.loads(out)["codex_home"] == {
+        "path": str(home), "exists": True, "sessions": 0
+    }

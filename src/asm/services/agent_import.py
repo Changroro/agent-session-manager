@@ -710,25 +710,18 @@ def read_codex_rollout(path: Path) -> tuple[list[Turn], str, str]:
     return turns, cwd, model
 
 
-def codex_session_dirs() -> list[Path]:
-    """sessions/ tree of every Codex home, so a second account is not invisible."""
-    return models.resolve_session_dirs(CODEX_SESSIONS_DIR)
-
-
 def codex_rollout_files() -> list[Path]:
-    """Every Codex rollout transcript across all Codex homes, newest first."""
-    found: list[Path] = []
-    for directory in codex_session_dirs():
-        found.extend(directory.rglob("rollout-*.jsonl"))
-    return _newest_first(found)
+    """Every rollout transcript in the active CODEX_HOME, newest first."""
+    if not CODEX_SESSIONS_DIR.exists():
+        return []
+    return _newest_first(CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"))
 
 
 def find_codex_rollout(session_id: str) -> Path | None:
-    """Locate a rollout by session id in any Codex home."""
-    for directory in codex_session_dirs():
-        for hit in directory.rglob(f"rollout-*{session_id}.jsonl"):
-            return hit
-    return None
+    """Locate a rollout by session id in the active CODEX_HOME."""
+    if not CODEX_SESSIONS_DIR.exists():
+        return None
+    return next(CODEX_SESSIONS_DIR.rglob(f"rollout-*{session_id}.jsonl"), None)
 
 
 def _imported_from_codex_digests() -> set[str]:
