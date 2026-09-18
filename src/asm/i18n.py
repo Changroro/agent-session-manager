@@ -278,7 +278,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Delete all empty todo files?\n\n{count} empty files found.\n[dim]Moved to trash, recoverable[/]",
         "ko": "빈 Todo 파일을 모두 삭제하시겠습니까?\n\n{count}개의 빈 파일.\n[dim]휴지통으로 이동, 복구 가능[/]",
     },
-    "dt.prune_ok": {"en": "Pruned {ok} empty files", "ko": "빈 파일 {ok}개 정리 완료"},
+    "dt.prune_ok": {"en": "Pruned {ok} empty files ({fail} failed)", "ko": "빈 파일 {ok}개 정리 완료 ({fail}개 실패)"},
     "dt.btn_trash_orphaned_debug": {"en": "Trash Orphaned ({count})", "ko": "Orphaned 삭제 ({count})"},
     "dt.btn_trash_orphaned_todo": {"en": "Trash Orphaned ({count})", "ko": "Orphaned 삭제 ({count})"},
     "dt.confirm_trash_orphaned_debug": {
@@ -452,15 +452,10 @@ def t(key: str, **kwargs) -> str:
     """Get translated string. Supports {placeholder} formatting."""
     entry = TRANSLATIONS.get(key)
     if not entry:
-        return key
-    text = entry.get(_current_lang, entry.get("en", key))
-    if kwargs:
-        try:
-            text = text.format(**kwargs)
-        except (KeyError, IndexError, ValueError):
-            # Missing/typo'd placeholder shouldn't crash the UI — return raw text.
-            pass
-    return text
+        raise KeyError(f"Unknown translation key: {key}")
+    if _current_lang not in entry:
+        raise KeyError(f"Missing {_current_lang} translation: {key}")
+    return entry[_current_lang].format(**kwargs)
 
 
 def init_lang(cli_lang: str | None = None) -> None:

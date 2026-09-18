@@ -54,6 +54,8 @@ def _setup_fake_claude(monkeypatch, tmp_path: Path) -> dict[str, Path | str]:
 
     backups_dir = home / ".cc-tui" / "backups"
     backups_dir.mkdir(parents=True)
+    app_data_dir = home / ".asm"
+    app_data_dir.mkdir()
 
     project_a = str(home / "work" / "project-alpha")
     project_b = str(home / "work" / "project-beta")
@@ -166,6 +168,8 @@ def _setup_fake_claude(monkeypatch, tmp_path: Path) -> dict[str, Path | str]:
     monkeypatch.setattr(models, "PLUGINS_DIR", plugins_dir)
     monkeypatch.setattr(models, "SKILLS_DIR", skills_dir)
     monkeypatch.setattr(models, "BACKUP_BASE_DIR", backups_dir)
+    monkeypatch.setattr(models, "APP_DATA_DIR", app_data_dir)
+    monkeypatch.setattr(models, "RECOVERY_BASE_DIR", app_data_dir / "recovery")
 
     monkeypatch.setattr(claude_data, "CLAUDE_DIR", claude_dir)
     monkeypatch.setattr(claude_data, "CLAUDE_JSON", claude_json)
@@ -184,9 +188,25 @@ def _setup_fake_claude(monkeypatch, tmp_path: Path) -> dict[str, Path | str]:
     # Keep Claude-only tests isolated from any real ~/.codex on this machine,
     # and drop usage caches primed by earlier tests against other tmp dirs.
     from asm.services import codex_data
+    from asm.services import artifacts as artifacts_service, search as search_service
+    from asm.services import agent_import as agent_import_service
+    from asm.screens import backups as backups_screen
     codex_data.refresh()
     claude_data.refresh_usage_cache()
     monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", claude_dir / "no-codex")
+    isolated_codex = claude_dir / "no-codex-home"
+    monkeypatch.setattr(backup_service, "CODEX_DIR", isolated_codex)
+    monkeypatch.setattr(backup_service, "CODEX_SESSIONS_DIR", isolated_codex / "sessions")
+    monkeypatch.setattr(backups_screen, "CODEX_DIR", isolated_codex)
+    monkeypatch.setattr(backups_screen, "CODEX_SESSIONS_DIR", isolated_codex / "sessions")
+    monkeypatch.setattr(agent_import_service, "CODEX_CONFIG", isolated_codex / "config.toml")
+    monkeypatch.setattr(agent_import_service, "CODEX_SESSIONS_DIR", isolated_codex / "sessions")
+    monkeypatch.setattr(agent_import_service, "CODEX_IMPORT_RECORDS", isolated_codex / "imports.json")
+    monkeypatch.setattr(agent_import_service, "CLAUDE_JSON", claude_json)
+    monkeypatch.setattr(agent_import_service, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(artifacts_service, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(search_service, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(search_service, "CODEX_SESSIONS_DIR", claude_dir / "no-codex")
     monkeypatch.setattr(cleaner, "SESSION_ENV_DIR", session_env_dir)
     monkeypatch.setattr(cleaner, "FILE_HISTORY_DIR", file_history_dir)
     monkeypatch.setattr(cleaner, "DEBUG_DIR", debug_dir)

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tomllib
 import uuid
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from asm import models
 from asm.models import CLAUDE_JSON, CODEX_DIR, CODEX_SESSIONS_DIR, PROJECTS_DIR, encode_path
+from asm.utils import strict_child, validate_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,14 @@ TITLE_MAX_CHARS = 80
 # Hashing every transcript costs a full read; this box already holds 25k Codex
 # rollouts, so a plan covers the newest N and reports the rest as truncated.
 SESSION_PLAN_LIMIT = 200
+
+
+def _has_entries(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_file():
+        return True
+    return any(path.iterdir())
 
 
 @dataclass(frozen=True)
@@ -93,20 +103,34 @@ def read_codex_mcp() -> dict[str, McpServer]:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise AgentImportError(f"cannot read {CODEX_CONFIG}: {exc}") from exc
 
+    if not isinstance(data, dict) or not isinstance(data.get("mcp_servers", {}), dict):
+        raise AgentImportError(f"unexpected MCP schema in {CODEX_CONFIG}")
     servers: dict[str, McpServer] = {}
-    for name, entry in (data.get("mcp_servers") or {}).items():
-        if not isinstance(entry, dict):
-            continue
+    for name, entry in data.get("mcp_servers", {}).items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            raise AgentImportError(f"unexpected MCP entry in {CODEX_CONFIG}")
+        args = entry.get("args", [])
+        env = entry.get("env", {})
+        headers = entry.get("http_headers", {})
+        if not isinstance(args, list) or any(not isinstance(value, str) for value in args):
+            raise AgentImportError(f"unexpected MCP args for {name}")
+        if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
+            raise AgentImportError(f"unexpected MCP env for {name}")
+        if not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()):
+            raise AgentImportError(f"unexpected MCP headers for {name}")
+        enabled = entry.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise AgentImportError(f"unexpected MCP enabled flag for {name}")
         url = entry.get("url")
         servers[name] = McpServer(
             name=name,
             transport="http" if url else "stdio",
             url=url,
             command=entry.get("command"),
-            args=list(entry.get("args") or []),
-            env=dict(entry.get("env") or {}),
-            headers=dict(entry.get("http_headers") or {}),
-            enabled=entry.get("enabled", True),
+            args=args,
+            env=env,
+            headers=headers,
+            enabled=enabled,
         )
     return servers
 
@@ -120,19 +144,34 @@ def read_claude_mcp() -> dict[str, McpServer]:
     except (OSError, json.JSONDecodeError) as exc:
         raise AgentImportError(f"cannot read {CLAUDE_JSON}: {exc}") from exc
 
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+        raise AgentImportError(f"unexpected MCP schema in {CLAUDE_JSON}")
     servers: dict[str, McpServer] = {}
-    for name, entry in (data.get("mcpServers") or {}).items():
-        if not isinstance(entry, dict):
-            continue
+    for name, entry in data.get("mcpServers", {}).items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            raise AgentImportError(f"unexpected MCP entry in {CLAUDE_JSON}")
+        args = entry.get("args", [])
+        env = entry.get("env", {})
+        headers = entry.get("headers", {})
+        if not isinstance(args, list) or any(not isinstance(value, str) for value in args):
+            raise AgentImportError(f"unexpected MCP args for {name}")
+        if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
+            raise AgentImportError(f"unexpected MCP env for {name}")
+        if not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()):
+            raise AgentImportError(f"unexpected MCP headers for {name}")
+        disabled = entry.get("disabled", False)
+        if not isinstance(disabled, bool):
+            raise AgentImportError(f"unexpected MCP disabled flag for {name}")
         transport = entry.get("type") or ("http" if entry.get("url") else "stdio")
         servers[name] = McpServer(
             name=name,
             transport=transport,
             url=entry.get("url"),
             command=entry.get("command"),
-            args=list(entry.get("args") or []),
-            env=dict(entry.get("env") or {}),
-            headers=dict(entry.get("headers") or {}),
+            args=args,
+            env=env,
+            headers=headers,
+            enabled=not disabled,
         )
     return servers
 
@@ -165,6 +204,9 @@ def plan_mcp(direction: str) -> McpPlan:
     for name, server in src.items():
         if name in dst:
             plan.already_present.append(name)
+            continue
+        if not server.enabled:
+            plan.unsupported.append((name, "disabled at source"))
             continue
         reason = _unsupported_reason(server, target)
         if reason:
@@ -209,10 +251,37 @@ def _claude_add_argv(server: McpServer) -> list[str]:
 
 def _append_codex_headers(server: McpServer) -> None:
     """Write http_headers for a server `codex mcp add` cannot express itself."""
-    lines = [f"\n[mcp_servers.{server.name}.http_headers]\n"]
-    lines += [f"{key} = {json.dumps(value)}\n" for key, value in server.headers.items()]
-    with CODEX_CONFIG.open("a", encoding="utf-8") as fh:
-        fh.write("".join(lines))
+    if not CODEX_CONFIG.exists():
+        raise AgentImportError(f"Codex CLI did not create {CODEX_CONFIG}")
+    lines = [f"\n[mcp_servers.{json.dumps(server.name)}.http_headers]\n"]
+    lines += [f"{json.dumps(key)} = {json.dumps(value)}\n" for key, value in server.headers.items()]
+    payload = CODEX_CONFIG.read_text(encoding="utf-8") + "".join(lines)
+    tmp = CODEX_CONFIG.with_suffix(".toml.tmp")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(CODEX_CONFIG)
+    except OSError:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def _redact_server_text(server: McpServer, text: str) -> str:
+    redacted = text
+    for value in (*server.env.values(), *server.headers.values(), server.url or ""):
+        if value:
+            redacted = redacted.replace(value, "<redacted>")
+    return re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1<redacted>", redacted)
+
+
+def _restore_config_bytes(before: bytes | None) -> None:
+    if before is None:
+        if CODEX_CONFIG.exists():
+            CODEX_CONFIG.unlink()
+        return
+    tmp = CODEX_CONFIG.with_suffix(".rollback.tmp")
+    tmp.write_bytes(before)
+    tmp.replace(CODEX_CONFIG)
 
 
 def apply_mcp(plan: McpPlan, dry_run: bool = False) -> McpResult:
@@ -226,25 +295,37 @@ def apply_mcp(plan: McpPlan, dry_run: bool = False) -> McpResult:
 
     from asm.services import backup
 
-    result.backup_path = (
-        backup.create_codex_backup() if plan.target == "codex" else backup.create_config_backup()
-    )
+    target_config = CODEX_CONFIG if plan.target == "codex" else CLAUDE_JSON
+    if target_config.exists():
+        create_backup = backup.create_codex_backup if plan.target == "codex" else backup.create_config_backup
+        result.backup_path = create_backup()
+        if not result.backup_path:
+            raise AgentImportError("MCP target safety backup failed")
 
     for server in plan.new:
         argv = _codex_add_argv(server) if plan.target == "codex" else _claude_add_argv(server)
+        before = CODEX_CONFIG.read_bytes() if plan.target == "codex" and CODEX_CONFIG.exists() else None
         try:
             proc = _run(argv)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            result.failed.append((server.name, str(exc)))
+        except subprocess.TimeoutExpired:
+            result.failed.append((server.name, "MCP command timed out"))
+            continue
+        except OSError as exc:
+            result.failed.append((server.name, _redact_server_text(server, f"MCP command failed: {exc}")))
             continue
         if proc.returncode != 0:
-            result.failed.append((server.name, (proc.stderr or proc.stdout).strip()[:200]))
+            detail = _redact_server_text(server, (proc.stderr or proc.stdout).strip()[:200])
+            result.failed.append((server.name, detail or "MCP command failed"))
             continue
         if plan.target == "codex" and server.headers:
             try:
                 _append_codex_headers(server)
-            except OSError as exc:
-                result.failed.append((server.name, f"headers not written: {exc}"))
+            except (OSError, AgentImportError) as exc:
+                try:
+                    _restore_config_bytes(before)
+                except OSError as rollback_error:
+                    raise AgentImportError(f"MCP rollback failed: {rollback_error}") from rollback_error
+                result.failed.append((server.name, f"headers not written: {_redact_server_text(server, str(exc))}"))
                 continue
         result.imported.append(server.name)
     return result
@@ -300,11 +381,16 @@ def _claude_text(content) -> str:
         return content.strip()
     if not isinstance(content, list):
         return ""
-    parts = [
-        block["text"]
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
-    ]
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise AgentImportError("unexpected Claude content block")
+        if block.get("type") == "text":
+            text = block.get("text")
+            if text is not None and not isinstance(text, str):
+                raise AgentImportError("unexpected Claude text block")
+            if text:
+                parts.append(text)
     return "\n".join(parts).strip()
 
 
@@ -314,7 +400,12 @@ def _is_injected_user_line(obj: dict, text: str) -> bool:
     Codex has no equivalent: a `<teammate-message>` there is real conversation
     input, so the rollout reader deliberately keeps those.
     """
-    return bool(obj.get("isMeta")) or text.startswith("<") or text.startswith("#")
+    if obj.get("isMeta"):
+        return True
+    return (
+        text.startswith(("<command-name>", "<local-command", "<system-reminder>", "<task-notification>"))
+        or text.startswith(("# AGENTS.md", "# CLAUDE.md"))
+    )
 
 
 def read_claude_session(path: Path) -> tuple[list[Turn], str, int]:
@@ -327,21 +418,27 @@ def read_claude_session(path: Path) -> tuple[list[Turn], str, int]:
             for line in fh:
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise AgentImportError(f"malformed Claude transcript: {path}") from exc
                 if not isinstance(obj, dict):
                     continue
                 kind = obj.get("type")
                 if kind not in ("user", "assistant"):
                     continue
-                cwd = obj.get("cwd") or cwd
+                value_cwd = obj.get("cwd")
+                if value_cwd is not None and not isinstance(value_cwd, str):
+                    raise AgentImportError(f"unexpected cwd in {path}")
+                cwd = value_cwd or cwd
                 message = obj.get("message")
                 if not isinstance(message, dict):
                     continue
                 usage = message.get("usage")
                 if isinstance(usage, dict):
-                    total_tokens += int(usage.get("input_tokens") or 0)
-                    total_tokens += int(usage.get("output_tokens") or 0)
+                    try:
+                        total_tokens += int(usage.get("input_tokens") or 0)
+                        total_tokens += int(usage.get("output_tokens") or 0)
+                    except (TypeError, ValueError) as exc:
+                        raise AgentImportError(f"unexpected token usage in {path}") from exc
                 text = _claude_text(message.get("content"))
                 if not text:
                     continue
@@ -406,7 +503,7 @@ def claude_session_files() -> list[Path]:
         return []
     # One level only — deeper files are <session>/subagents/agent-*.jsonl, which
     # belong to a parent session rather than being sessions of their own.
-    return _newest_first(PROJECTS_DIR.glob("*/*.jsonl"))
+    return _newest_first(path for path in PROJECTS_DIR.glob("*/*.jsonl") if not path.is_symlink())
 
 
 def plan_sessions_to_codex(
@@ -433,6 +530,9 @@ def plan_sessions_to_codex(
     for path in considered:
         path = Path(path)
         try:
+            if path.is_symlink():
+                raise AgentImportError(f"Refusing to import symlink: {path}")
+            strict_child(path, PROJECTS_DIR)
             turns, cwd, total_tokens = read_claude_session(path)
             digest = _digest(path)
             stat = path.stat()
@@ -441,6 +541,9 @@ def plan_sessions_to_codex(
             continue
         if not turns:
             plan.skipped.append((str(path), "no text turns"))
+            continue
+        if not cwd:
+            plan.skipped.append((str(path), "transcript has no cwd"))
             continue
         candidate = SessionCandidate(
             path=str(path),
@@ -604,8 +707,13 @@ def _write_import_record(candidate: SessionCandidate, thread_id: str, when: date
     )
     CODEX_IMPORT_RECORDS.parent.mkdir(parents=True, exist_ok=True)
     tmp = CODEX_IMPORT_RECORDS.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(CODEX_IMPORT_RECORDS)
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CODEX_IMPORT_RECORDS)
+    except OSError:
+        if tmp.exists():
+            tmp.unlink()
+        raise
 
 
 def apply_sessions_to_codex(plan: SessionPlan, dry_run: bool = False) -> SessionResult:
@@ -620,7 +728,10 @@ def apply_sessions_to_codex(plan: SessionPlan, dry_run: bool = False) -> Session
     from asm.services import backup
 
     cli_version = codex_cli_version()
-    result.backup_path = backup.create_codex_backup()
+    if _has_entries(CODEX_SESSIONS_DIR):
+        result.backup_path = backup.create_codex_backup()
+        if not result.backup_path:
+            raise AgentImportError("Codex session safety backup failed")
 
     for candidate in plan.new:
         created = datetime.now().astimezone()
@@ -634,7 +745,12 @@ def apply_sessions_to_codex(plan: SessionPlan, dry_run: bool = False) -> Session
             tmp = target.with_suffix(".jsonl.tmp")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(target)
-            _write_import_record(candidate, thread_id, created)
+            try:
+                _write_import_record(candidate, thread_id, created)
+            except (AgentImportError, OSError):
+                if target.exists():
+                    target.unlink()
+                raise
         except (AgentImportError, OSError) as exc:
             result.failed.append((candidate.path, str(exc)))
             continue
@@ -662,13 +778,16 @@ def claude_cli_version() -> str:
 def _rollout_text(content) -> str:
     if not isinstance(content, list):
         return ""
-    parts = [
-        block["text"]
-        for block in content
-        if isinstance(block, dict)
-        and block.get("type") in ("input_text", "output_text")
-        and block.get("text")
-    ]
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise AgentImportError("unexpected Codex content block")
+        if block.get("type") in ("input_text", "output_text"):
+            text = block.get("text")
+            if text is not None and not isinstance(text, str):
+                raise AgentImportError("unexpected Codex text block")
+            if text:
+                parts.append(text)
     return "\n".join(parts).strip()
 
 
@@ -682,8 +801,8 @@ def read_codex_rollout(path: Path) -> tuple[list[Turn], str, str]:
             for line in fh:
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise AgentImportError(f"malformed Codex rollout: {path}") from exc
                 if not isinstance(obj, dict):
                     continue
                 payload = obj.get("payload")
@@ -714,14 +833,26 @@ def codex_rollout_files() -> list[Path]:
     """Every rollout transcript in the active CODEX_HOME, newest first."""
     if not CODEX_SESSIONS_DIR.exists():
         return []
-    return _newest_first(CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"))
+    try:
+        files = list(CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"))
+    except (OSError, PermissionError) as exc:
+        raise AgentImportError(f"cannot read {CODEX_SESSIONS_DIR}: {exc}") from exc
+    root = CODEX_SESSIONS_DIR.resolve()
+    unsafe = [path for path in files if path.is_symlink() or not path.resolve().is_relative_to(root)]
+    if unsafe:
+        raise AgentImportError(f"refusing rollout outside active Codex home: {unsafe[0]}")
+    return _newest_first(files)
 
 
 def find_codex_rollout(session_id: str) -> Path | None:
     """Locate a rollout by session id in the active CODEX_HOME."""
+    validate_identifier(session_id, "session id")
     if not CODEX_SESSIONS_DIR.exists():
         return None
-    return next(CODEX_SESSIONS_DIR.rglob(f"rollout-*{session_id}.jsonl"), None)
+    for path in codex_rollout_files():
+        if path.name.endswith(f"-{session_id}.jsonl"):
+            return path
+    return None
 
 
 def _imported_from_codex_digests() -> set[str]:
@@ -808,7 +939,7 @@ def _claude_lines(
             message = {
                 "role": "assistant",
                 "type": "message",
-                "id": f"msg_import_{index}",
+                    "id": f"msg_import_{session_id}_{index}",
                 "content": [{"type": "text", "text": turn.text}],
                 "stop_reason": None,
                 "stop_sequence": None,
@@ -827,7 +958,13 @@ def _write_claude_import_record(candidate: SessionCandidate, session_id: str, wh
     path = claude_import_records()
     records = []
     if path.exists():
-        records = json.loads(path.read_text(encoding="utf-8"))["records"]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise AgentImportError(f"cannot read {path}: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+            raise AgentImportError(f"unexpected shape in {path}")
+        records = data["records"]
     records.append(
         {
             "source_path": candidate.path,
@@ -840,8 +977,13 @@ def _write_claude_import_record(candidate: SessionCandidate, session_id: str, wh
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(json.dumps({"records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        if tmp.exists():
+            tmp.unlink()
+        raise
 
 
 def apply_sessions_to_claude(plan: SessionPlan, dry_run: bool = False) -> SessionResult:
@@ -856,7 +998,10 @@ def apply_sessions_to_claude(plan: SessionPlan, dry_run: bool = False) -> Sessio
     from asm.services import backup
 
     version = claude_cli_version()
-    result.backup_path = backup.create_sessions_backup()
+    if _has_entries(PROJECTS_DIR):
+        result.backup_path = backup.create_sessions_backup()
+        if not result.backup_path:
+            raise AgentImportError("Claude session safety backup failed")
 
     for candidate in plan.new:
         when = datetime.now().astimezone()
@@ -870,7 +1015,12 @@ def apply_sessions_to_claude(plan: SessionPlan, dry_run: bool = False) -> Sessio
             tmp = target.with_suffix(".jsonl.tmp")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(target)
-            _write_claude_import_record(candidate, session_id, when)
+            try:
+                _write_claude_import_record(candidate, session_id, when)
+            except (AgentImportError, OSError):
+                if target.exists():
+                    target.unlink()
+                raise
         except (AgentImportError, OSError) as exc:
             result.failed.append((candidate.path, str(exc)))
             continue

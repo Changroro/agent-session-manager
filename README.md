@@ -71,7 +71,7 @@ same view filtered to **Claude** and to **Codex**:
 ### Claude ↔ Codex (`F8` tab)
 - **MCP servers, both ways:** compares `~/.codex/config.toml` with `~/.claude.json`, lists what only one side has, and adds it through that agent's own `mcp add` CLI (so file format and comments stay intact). Auth headers and env vars are carried over verbatim; `codex mcp add` can't express HTTP headers, so those are appended as `[mcp_servers.<name>.http_headers]`
 - **Session copies, both ways:** Claude transcripts become Codex rollout threads and vice versa — verified end-to-end by resuming the result in the real CLI. Claude→Codex writes the same `content_sha256` ledger the official importer uses, so it won't duplicate what Codex already imported, and unlike `/import` you pick the sessions (no 30-day / 50-session cap)
-- Imported copies carry **zeroed token usage**, so a session that moved never gets priced twice
+- Imported copies carry **zeroed token usage**, so a copied session is never priced twice
 - Everything is planned before it's written: a preview lists importable / skipped / unsupported items, and a backup snapshot is taken before the first write
 - **Nothing is preselected.** A plan covers the newest 200 transcripts (hashing every one of 25k+ rollouts would be slow) and states how many older ones it left out, so a truncated list never reads as "that's all of them"
 
@@ -149,7 +149,7 @@ Both sources are always available; `--source` only sets the dashboard's initial 
 
 ### Headless CLI
 
-Every feature is also available as a subcommand — handy for scripts and AI agents. In a terminal you get rich tables; piped output is plain text, and `--json` gives machine-readable output.
+Data operations have headless subcommands for scripts and AI agents. Instruction editing, Codex cwd moves, and Artifact browser/clipboard actions remain TUI actions. In a terminal you get rich tables; piped output is plain text, and `--json` gives machine-readable output.
 
 ```bash
 # Read-only
@@ -159,7 +159,7 @@ asm sessions --search "firewall"  # Search sessions by title
 asm preview <session-id>          # Print a conversation
 asm resume <session-id>           # cd into its project & resume (Claude/Codex)
 asm artifacts                     # Pages published via the Artifact tool
-asm import list --to claude       # Sessions that could move Codex -> Claude
+asm import list --to claude       # Sessions that could be copied Codex -> Claude
 asm backup list / asm recovery list
 
 # Destructive — always confirms first (skip with --yes); everything goes
@@ -169,8 +169,8 @@ asm trash <session-id>
 asm backup create --type full     # config|full|settings|plugins|sessions|codex
 asm backup restore <path> / asm recovery restore <id>
 asm migrate /old/project /new/project
-asm import session <session-id>   # Move one session; direction inferred from the id
-asm import mcp --to codex         # Move MCP servers between agents
+asm import session <session-id>   # Copy one session; direction inferred from the id
+asm import mcp --to codex         # Copy MCP servers between agents
 ```
 
 Codex App, CLI, and companion agents share one session store — see

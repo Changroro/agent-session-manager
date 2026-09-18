@@ -22,9 +22,13 @@ from asm.models import (
     SessionDetail,
     Stats,
 )
-from asm.utils import RECENT_DAYS_LIMIT, SUMMARY_MAX_CHARS, TOP_PROJECT_LIMIT
+from asm.utils import RECENT_DAYS_LIMIT, SUMMARY_MAX_CHARS, TOP_PROJECT_LIMIT, strict_child, validate_identifier
 
 logger = logging.getLogger(__name__)
+
+
+class CodexDataError(RuntimeError):
+    pass
 
 # Label for sessions whose rollout carries no model id anywhere; kept visible in
 # model tables instead of silently assuming a model. Priced at the default GPT tier.
@@ -41,8 +45,12 @@ def _rollout_files(limit: int | None = None) -> list[Path]:
         return []
     try:
         files = list(CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"))
-    except (PermissionError, OSError):
-        return []
+    except (PermissionError, OSError) as exc:
+        raise CodexDataError(f"cannot read {CODEX_SESSIONS_DIR}: {exc}") from exc
+    root = CODEX_SESSIONS_DIR.resolve()
+    unsafe = [f for f in files if f.is_symlink() or not f.resolve().is_relative_to(root)]
+    if unsafe:
+        raise CodexDataError(f"refusing rollout outside active Codex home: {unsafe[0]}")
     files.sort(key=lambda f: _safe_mtime(f), reverse=True)
     return files[:limit] if limit else files
 
@@ -50,8 +58,8 @@ def _rollout_files(limit: int | None = None) -> list[Path]:
 def _safe_mtime(f: Path) -> float:
     try:
         return f.stat().st_mtime
-    except OSError:
-        return 0.0
+    except OSError as exc:
+        raise CodexDataError(f"cannot stat {f}: {exc}") from exc
 
 
 def total_session_count() -> int:
@@ -59,8 +67,8 @@ def total_session_count() -> int:
         return 0
     try:
         return sum(1 for _ in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"))
-    except (PermissionError, OSError):
-        return 0
+    except (PermissionError, OSError) as exc:
+        raise CodexDataError(f"cannot read {CODEX_SESSIONS_DIR}: {exc}") from exc
 
 
 # Memo of the ledger read so one refresh serves every aggregation once.
@@ -83,7 +91,8 @@ def _scanned_sessions() -> list[dict]:
     sessions = [
         record
         for record in ledger.codex_records()
-        if Path(record["path"]).resolve().is_relative_to(root)
+        if not Path(record["path"]).is_symlink()
+        and Path(record["path"]).resolve().is_relative_to(root)
     ]
     _scan_cache["all"] = sessions
     return sessions
@@ -104,21 +113,33 @@ def _scan_session(f: Path) -> dict | None:
             for line in fh:
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise CodexDataError(f"malformed rollout: {f}") from exc
+                if not isinstance(obj, dict):
+                    raise CodexDataError(f"unexpected rollout record: {f}")
                 typ = obj.get("type")
                 payload = obj.get("payload", {})
+                if not isinstance(payload, dict):
+                    raise CodexDataError(f"unexpected rollout payload: {f}")
                 if typ == "session_meta":
+                    if not isinstance(payload.get("cwd", ""), str):
+                        raise CodexDataError(f"unexpected session cwd: {f}")
                     meta = payload
                     model = payload.get("model", "") or model
                 elif typ == "turn_context":
+                    if not isinstance(payload.get("model", ""), str):
+                        raise CodexDataError(f"unexpected turn model: {f}")
                     # The authoritative model id lives here (session_meta only
                     # carries model_provider). Last turn wins on mid-session switch.
                     model = payload.get("model", "") or model
                 elif typ == "event_msg" and payload.get("type") == "token_count":
                     info = payload.get("info") or {}
+                    if not isinstance(info, dict):
+                        raise CodexDataError(f"unexpected token info: {f}")
                     usage = info.get("total_token_usage")
                     if usage:
+                        if not isinstance(usage, dict):
+                            raise CodexDataError(f"unexpected token usage: {f}")
                         last_usage = usage
                     if not model:
                         model = info.get("model", "") or model
@@ -127,11 +148,20 @@ def _scan_session(f: Path) -> dict | None:
                     text = _extract_input_text(payload.get("content", []))
                     if text and not text.startswith("#") and not text.startswith("<"):
                         first_prompt = text[:SUMMARY_MAX_CHARS]
-    except OSError:
-        return None
+    except (OSError, UnicodeError) as exc:
+        raise CodexDataError(f"cannot read {f}: {exc}") from exc
     if meta is None:
         return None
     git = meta.get("git") or {}
+    if not isinstance(git, dict):
+        raise CodexDataError(f"unexpected git metadata: {f}")
+    if last_usage is not None and any(
+        not isinstance(last_usage.get(key, 0), (int, float)) or last_usage.get(key, 0) < 0
+        for key in ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens")
+    ):
+        raise CodexDataError(f"unexpected token usage: {f}")
+    if not isinstance(meta.get("id", f.stem), str) or not isinstance(meta.get("timestamp", ""), str):
+        raise CodexDataError(f"unexpected session metadata: {f}")
     return {
         "id": meta.get("id", f.stem),
         "cwd": meta.get("cwd", "") or "",
@@ -149,8 +179,8 @@ def _scan_session(f: Path) -> dict | None:
 def _safe_size(f: Path) -> int:
     try:
         return f.stat().st_size
-    except OSError:
-        return 0
+    except OSError as exc:
+        raise CodexDataError(f"cannot stat {f}: {exc}") from exc
 
 
 def _extract_input_text(content) -> str:
@@ -207,10 +237,14 @@ def get_sessions_by_paths(paths) -> list[SessionDetail]:
     results are newest-first.
     """
     result = []
+    root = CODEX_SESSIONS_DIR.resolve()
     for p in paths:
         f = Path(p)
-        if not f.exists():
+        if not f.exists() and not f.is_symlink():
             continue
+        if f.is_symlink():
+            raise CodexDataError(f"Refusing to read rollout symlink: {f}")
+        strict_child(f, root)
         info = _scan_session(f)
         if info is not None:
             result.append(_detail_from_info(info))
@@ -236,20 +270,30 @@ def get_session_messages(session_id: str, project_dir: str | None = None, limit:
 
     ``project_dir`` carries the rollout file path (set by get_project_sessions).
     """
+    validate_identifier(session_id, "session id")
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
     path = Path(project_dir) if project_dir else _find_rollout(session_id)
     if not path or not path.exists():
         return []
+    if path.is_symlink():
+        raise CodexDataError(f"Refusing to read rollout symlink: {path}")
+    strict_child(path, CODEX_SESSIONS_DIR)
     messages: list[dict] = []
     try:
         with open(path) as fh:
             for line in fh:
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise CodexDataError(f"malformed rollout: {path}") from exc
+                if not isinstance(obj, dict):
+                    raise CodexDataError(f"unexpected rollout record: {path}")
                 if obj.get("type") != "response_item":
                     continue
                 payload = obj.get("payload", {})
+                if not isinstance(payload, dict):
+                    raise CodexDataError(f"unexpected rollout payload: {path}")
                 if payload.get("type") != "message":
                     continue
                 role = payload.get("role")
@@ -258,9 +302,9 @@ def get_session_messages(session_id: str, project_dir: str | None = None, limit:
                 text = _extract_message_text(payload.get("content", []))
                 if text:
                     messages.append({"type": role, "content": text})
-    except OSError:
-        return []
-    return messages[-limit:] if len(messages) > limit else messages
+    except (OSError, UnicodeError) as exc:
+        raise CodexDataError(f"cannot read {path}: {exc}") from exc
+    return messages[-limit:] if limit and len(messages) > limit else messages
 
 
 def _extract_message_text(content) -> str:
@@ -277,8 +321,9 @@ def _extract_message_text(content) -> str:
 
 
 def _find_rollout(session_id: str) -> Path | None:
+    validate_identifier(session_id, "session id")
     for f in _rollout_files():
-        if session_id in f.name:
+        if f.name.endswith(f"-{session_id}.jsonl"):
             return f
     return None
 
@@ -354,8 +399,9 @@ def _retarget_cwd(obj, new_cwd: str) -> bool:
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == "cwd" and isinstance(v, str):
-                obj[k] = new_cwd
-                changed = True
+                if v != new_cwd:
+                    obj[k] = new_cwd
+                    changed = True
             elif isinstance(v, (dict, list)):
                 changed = _retarget_cwd(v, new_cwd) or changed
     elif isinstance(obj, list):
@@ -389,24 +435,27 @@ def move_session(rollout_path: str, new_cwd: str) -> bool:
     except OSError:
         return False
     try:
-        create_recovery_snapshot(p, "codex-session")
         out, changed = [], False
         for line in p.read_text().splitlines():
             if not line.strip():
                 continue
             try:
                 obj = json.loads(line)
-            except json.JSONDecodeError:
-                out.append(line)
-                continue
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise CodexDataError(f"malformed rollout: {p}") from exc
+            if not isinstance(obj, dict):
+                raise CodexDataError(f"unexpected rollout record: {p}")
             if _retarget_cwd(obj, new_cwd):
                 changed = True
             out.append(json.dumps(obj, ensure_ascii=False))
         if changed:
+            snapshot_id = create_recovery_snapshot(p, "codex-session")
+            if not snapshot_id:
+                return False
             _atomic_write_text(p, "\n".join(out) + "\n")
             refresh()
         return changed
-    except OSError:
+    except (OSError, CodexDataError):
         return False
 
 

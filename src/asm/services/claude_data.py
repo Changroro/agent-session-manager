@@ -42,14 +42,19 @@ from asm.models import (
     decode_path_hint,
     encode_path,
 )
+from asm.utils import validate_identifier
+
+
+class ClaudeDataError(RuntimeError):
+    pass
 
 
 def _file_count(path: Path) -> int:
     """Count files and directories in a path."""
     try:
         return sum(1 for _ in path.iterdir())
-    except (PermissionError, OSError):
-        return 0
+    except (PermissionError, OSError) as exc:
+        raise ClaudeDataError(f"cannot read {path}: {exc}") from exc
 
 
 def _get_session_envs(project_path: str) -> list[str]:
@@ -61,8 +66,8 @@ def _get_session_envs(project_path: str) -> list[str]:
             for d in SESSION_ENV_DIR.iterdir():
                 if d.is_dir() and encoded in d.name:
                     envs.append(d.name)
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {SESSION_ENV_DIR}: {exc}") from exc
     return envs
 
 
@@ -71,9 +76,17 @@ def load_claude_json() -> dict:
     if not CLAUDE_JSON.exists():
         return {}
     try:
-        return json.loads(CLAUDE_JSON.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+        data = json.loads(CLAUDE_JSON.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        raise ClaudeDataError(f"cannot read {CLAUDE_JSON}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ClaudeDataError(f"unexpected shape in {CLAUDE_JSON}: expected object")
+    projects = data.get("projects", {})
+    if not isinstance(projects, dict):
+        raise ClaudeDataError(f"unexpected projects shape in {CLAUDE_JSON}")
+    if any(not isinstance(config, dict) for config in projects.values()):
+        raise ClaudeDataError(f"unexpected project entry in {CLAUDE_JSON}")
+    return data
 
 
 def get_projects() -> list[ProjectInfo]:
@@ -109,6 +122,10 @@ def _build_encoded_to_paths_map() -> dict[str, list[str]]:
     return dict(encoded_to_paths)
 
 
+def project_paths_for_encoded(dir_name: str) -> list[str]:
+    return _build_encoded_to_paths_map().get(dir_name, [])
+
+
 def _resolve_project_dir(project_ref: str | None) -> Path | None:
     """Resolve a project path or already-encoded directory name to a projects dir.
 
@@ -123,10 +140,14 @@ def _resolve_project_dir(project_ref: str | None) -> Path | None:
         return None
     # Already-encoded directory name (relative, no leading slash).
     if not project_ref.startswith("/"):
+        validate_identifier(project_ref, "encoded project directory")
         direct = PROJECTS_DIR / project_ref
         if direct.exists() and direct.parent == PROJECTS_DIR:
             return direct
     encoded = encode_path(project_ref)
+    matches = project_paths_for_encoded(encoded)
+    if len(matches) > 1:
+        raise ClaudeDataError(f"ambiguous encoded project directory: {encoded}")
     candidate = PROJECTS_DIR / encoded
     if candidate.exists():
         return candidate
@@ -166,8 +187,8 @@ def get_sessions() -> list[SessionInfo]:
                     is_orphaned=is_orphaned,
                 )
             )
-    except (PermissionError, OSError):
-        pass
+    except (PermissionError, OSError) as exc:
+        raise ClaudeDataError(f"cannot read {PROJECTS_DIR}: {exc}") from exc
     return result
 
 
@@ -179,8 +200,8 @@ def _find_session_envs_for_dir(dir_name: str) -> list[str]:
             for d in SESSION_ENV_DIR.iterdir():
                 if d.is_dir() and (d.name == dir_name or d.name.startswith(dir_name + "-")):
                     envs.append(d.name)
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {SESSION_ENV_DIR}: {exc}") from exc
     return envs
 
 
@@ -241,8 +262,13 @@ def _get_sessions_via_jsonl(project_dir: str | None) -> list[SessionDetail]:
                     for line in f:
                         try:
                             msg = json.loads(line)
+                            if not isinstance(msg, dict):
+                                raise ClaudeDataError(f"unexpected transcript record: {jsonl}")
                             if msg.get("type") == "user":
-                                content = msg.get("message", {}).get("content", "")
+                                message = msg.get("message", {})
+                                if not isinstance(message, dict):
+                                    raise ClaudeDataError(f"unexpected message shape: {jsonl}")
+                                content = message.get("content", "")
                                 if isinstance(content, str):
                                     first_prompt = content[:SUMMARY_MAX_CHARS]
                                 elif isinstance(content, list):
@@ -251,8 +277,8 @@ def _get_sessions_via_jsonl(project_dir: str | None) -> list[SessionDetail]:
                                             first_prompt = block.get("text", "")[:SUMMARY_MAX_CHARS]
                                             break
                                 break
-                        except json.JSONDecodeError:
-                            continue
+                        except (json.JSONDecodeError, UnicodeError) as exc:
+                            raise ClaudeDataError(f"malformed transcript: {jsonl}") from exc
                 result.append(
                     SessionDetail(
                         session_id=session_id,
@@ -264,14 +290,17 @@ def _get_sessions_via_jsonl(project_dir: str | None) -> list[SessionDetail]:
                         project_dir=d.name,
                     )
                 )
-            except (OSError, json.JSONDecodeError):
-                continue
+            except (OSError, UnicodeError) as exc:
+                raise ClaudeDataError(f"cannot read {jsonl}: {exc}") from exc
     result.sort(key=lambda s: s.last_modified, reverse=True)
     return result
 
 
 def get_session_messages(session_id: str, project_dir: str | None = None, limit: int = 50) -> list[dict]:
     """Get messages from a session. Uses SDK if available, fallback to JSONL."""
+    validate_identifier(session_id, "session id")
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
     if project_dir and _resolve_project_dir(project_dir):
         return _get_messages_via_jsonl(session_id, project_dir, limit)
     try:
@@ -323,10 +352,14 @@ def _get_messages_via_jsonl(session_id: str, project_dir: str | None, limit: int
             for line in f:
                 try:
                     msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise ClaudeDataError(f"malformed transcript: {jsonl_path}") from exc
+                if not isinstance(msg, dict):
+                    raise ClaudeDataError(f"unexpected transcript record: {jsonl_path}")
                 msg_type = msg.get("type")
                 if msg_type in ("user", "assistant"):
+                    if not isinstance(msg.get("message"), (dict, str)):
+                        raise ClaudeDataError(f"unexpected message shape: {jsonl_path}")
                     content = _extract_text_content(msg.get("message", {}))
                     if content:
                         messages.append({"type": msg_type, "content": content})
@@ -336,11 +369,11 @@ def _get_messages_via_jsonl(session_id: str, project_dir: str | None, limit: int
                     url = msg.get("url") or msg.get("prLink") or ""
                     if url:
                         meta_lines.append(f"PR: {url}")
-    except OSError:
-        pass
+    except (OSError, UnicodeError) as exc:
+        raise ClaudeDataError(f"cannot read {jsonl_path}: {exc}") from exc
 
     if messages:
-        return messages[-limit:] if len(messages) > limit else messages
+        return messages[-limit:] if limit and len(messages) > limit else messages
 
     # No conversation turns — surface whatever metadata exists so the preview is
     # informative instead of blank (these are title/PR/automation-only sessions).
@@ -385,7 +418,7 @@ def get_file_history() -> list[FileHistoryEntry]:
         for d in sorted(FILE_HISTORY_DIR.iterdir()):
             if not d.is_dir():
                 continue
-            is_orphaned = d.name not in active_session_ids if active_session_ids else False
+            is_orphaned = d.name not in active_session_ids
             result.append(
                 FileHistoryEntry(
                     dir_name=d.name,
@@ -394,8 +427,8 @@ def get_file_history() -> list[FileHistoryEntry]:
                     is_orphaned=is_orphaned,
                 )
             )
-    except (PermissionError, OSError):
-        pass
+    except (PermissionError, OSError) as exc:
+        raise ClaudeDataError(f"cannot read {FILE_HISTORY_DIR}: {exc}") from exc
     return result
 
 
@@ -409,12 +442,12 @@ def get_debug_files() -> list[DebugEntry]:
     try:
         for f in sorted(DEBUG_DIR.iterdir()):
             size = f.stat().st_size if f.is_file() else _dir_size(f)
-            is_orphaned = f.stem not in active_session_ids if active_session_ids else False
+            is_orphaned = f.stem not in active_session_ids
             result.append(
                 DebugEntry(name=f.name, path=str(f), size_bytes=size, is_orphaned=is_orphaned)
             )
-    except (PermissionError, OSError):
-        pass
+    except (PermissionError, OSError) as exc:
+        raise ClaudeDataError(f"cannot read {DEBUG_DIR}: {exc}") from exc
     return result
 
 
@@ -433,13 +466,14 @@ def get_todos() -> list[TodoEntry]:
                 if not d.is_dir():
                     continue
                 session_id = d.name
-                is_orphaned = session_id not in active_session_ids if active_session_ids else False
+                is_orphaned = session_id not in active_session_ids
                 result.append(
                     TodoEntry(name=session_id, path=str(d), size_bytes=_dir_size(d), is_orphaned=is_orphaned)
                 )
-        except (PermissionError, OSError):
-            pass
-        return result
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {TASKS_DIR}: {exc}") from exc
+        if result:
+            return result
     # Legacy fallback: flat todos/<sessionId>-agent-<id>.json files.
     if not TODOS_DIR.exists():
         return []
@@ -447,12 +481,12 @@ def get_todos() -> list[TodoEntry]:
         for f in sorted(TODOS_DIR.iterdir()):
             size = f.stat().st_size if f.is_file() else _dir_size(f)
             session_id = f.stem.split("-agent-")[0] if "-agent-" in f.stem else f.stem
-            is_orphaned = session_id not in active_session_ids if active_session_ids else False
+            is_orphaned = session_id not in active_session_ids
             result.append(
                 TodoEntry(name=f.name, path=str(f), size_bytes=size, is_orphaned=is_orphaned)
             )
-    except (PermissionError, OSError):
-        pass
+    except (PermissionError, OSError) as exc:
+        raise ClaudeDataError(f"cannot read {TODOS_DIR}: {exc}") from exc
     return result
 
 
@@ -477,8 +511,8 @@ def _get_active_session_ids() -> set[str]:
                 if d.is_dir():
                     for jsonl in d.rglob("*.jsonl"):
                         ids.add(jsonl.stem)
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {PROJECTS_DIR}: {exc}") from exc
     _active_ids_cache = ids
     return ids
 
@@ -494,8 +528,8 @@ def get_session_to_project_map() -> dict[str, str]:
                     project_path = _project_label_for_dir(d.name, encoded_to_paths)
                     for jsonl in d.glob("*.jsonl"):
                         mapping[jsonl.stem] = project_path
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {PROJECTS_DIR}: {exc}") from exc
     return mapping
 
 
@@ -519,8 +553,8 @@ def get_stats() -> Stats:
                     fh_total += 1
                     if d.name not in active_ids:
                         fh_orphaned += 1
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {FILE_HISTORY_DIR}: {exc}") from exc
 
     # Count debug files
     db_total, db_orphaned = 0, 0
@@ -530,21 +564,20 @@ def get_stats() -> Stats:
                 db_total += 1
                 if f.stem not in active_ids:
                     db_orphaned += 1
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {DEBUG_DIR}: {exc}") from exc
 
     # Count todo/task entries (tasks/<sessionId>/ dirs, or legacy todos/ files)
     td_total, td_orphaned = 0, 0
-    if TASKS_DIR.exists():
+    task_dirs = [d for d in TASKS_DIR.iterdir() if d.is_dir()] if TASKS_DIR.exists() else []
+    if task_dirs:
         try:
-            for d in TASKS_DIR.iterdir():
-                if not d.is_dir():
-                    continue
+            for d in task_dirs:
                 td_total += 1
                 if d.name not in active_ids:
                     td_orphaned += 1
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {TASKS_DIR}: {exc}") from exc
     elif TODOS_DIR.exists():
         try:
             for f in TODOS_DIR.iterdir():
@@ -552,8 +585,8 @@ def get_stats() -> Stats:
                 session_id = f.stem.split("-agent-")[0] if "-agent-" in f.stem else f.stem
                 if session_id not in active_ids:
                     td_orphaned += 1
-        except (PermissionError, OSError):
-            pass
+        except (PermissionError, OSError) as exc:
+            raise ClaudeDataError(f"cannot read {TODOS_DIR}: {exc}") from exc
 
     return Stats(
         total_projects=len(projects),
@@ -776,8 +809,8 @@ def get_project_sessions(project_path: str) -> list[SessionDetail]:
     for jsonl in project_dir.glob("*.jsonl"):
         try:
             stat = jsonl.stat()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise ClaudeDataError(f"cannot stat {jsonl}: {exc}") from exc
         session_id = jsonl.stem
         meta = index.get(session_id)
         if meta:
@@ -809,9 +842,14 @@ def _load_session_index(project_dir: Path) -> dict[str, dict]:
     if not index_path.exists():
         return {}
     try:
-        entries = json.loads(index_path.read_text()).get("entries", [])
-    except (json.JSONDecodeError, OSError):
-        return {}
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        raise ClaudeDataError(f"cannot read {index_path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("entries", []), list):
+        raise ClaudeDataError(f"unexpected session index shape: {index_path}")
+    entries = data.get("entries", [])
+    if any(not isinstance(entry, dict) for entry in entries):
+        raise ClaudeDataError(f"unexpected session index entry: {index_path}")
     return {
         e["sessionId"]: e
         for e in entries
@@ -828,8 +866,10 @@ def _scan_jsonl_summary(jsonl: Path) -> tuple[str, str]:
             for line in f:
                 try:
                     msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise ClaudeDataError(f"malformed transcript: {jsonl}") from exc
+                if not isinstance(msg, dict):
+                    raise ClaudeDataError(f"unexpected transcript record: {jsonl}")
                 mtype = msg.get("type")
                 if mtype == "ai-title" and not ai_title:
                     ai_title = (msg.get("aiTitle") or "")[:SUMMARY_MAX_CHARS]
@@ -847,8 +887,8 @@ def _scan_jsonl_summary(jsonl: Path) -> tuple[str, str]:
                                     break
                 if ai_title and first_prompt:
                     break
-    except OSError:
-        pass
+    except (OSError, UnicodeError) as exc:
+        raise ClaudeDataError(f"cannot read {jsonl}: {exc}") from exc
     return first_prompt, ai_title
 
 
@@ -877,19 +917,30 @@ def find_duplicate_sessions() -> dict[str, list[str]]:
 
 def _session_has_conversation(jsonl: Path) -> bool:
     """True if a session file has any user/assistant message with content."""
+    has_conversation, _corrupt = _session_state(jsonl)
+    return has_conversation
+
+
+def _session_state(jsonl: Path) -> tuple[bool, bool]:
+    has_conversation = False
     try:
-        with open(jsonl) as f:
+        with open(jsonl, encoding="utf-8") as f:
             for line in f:
                 try:
                     msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except (json.JSONDecodeError, UnicodeError):
+                    return has_conversation, True
+                if not isinstance(msg, dict):
+                    return has_conversation, True
                 if msg.get("type") in ("user", "assistant"):
-                    if _extract_text_content(msg.get("message", {})):
-                        return True
+                    message = msg.get("message")
+                    if not isinstance(message, (dict, str)):
+                        return has_conversation, True
+                    if _extract_text_content(message):
+                        has_conversation = True
     except OSError:
-        return True  # err on the safe side — don't flag as empty
-    return False
+        return False, True
+    return has_conversation, False
 
 
 # A session with a real conversation is far larger than this; only files under
@@ -919,7 +970,8 @@ def find_empty_sessions(size_cap: int = EMPTY_SESSION_SIZE_CAP) -> list[dict]:
                         continue
                 except OSError:
                     continue
-                if _session_has_conversation(jsonl):
+                has_conversation, corrupt = _session_state(jsonl)
+                if corrupt or has_conversation:
                     continue
                 _, title = _scan_jsonl_summary(jsonl)
                 result.append({

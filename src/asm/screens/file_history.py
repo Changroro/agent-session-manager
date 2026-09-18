@@ -20,6 +20,8 @@ def _display_name(dir_name: str, encoded_to_path: dict) -> str:
     """Convert dir_name to a readable display name."""
     actual = encoded_to_path.get(dir_name)
     if actual:
+        if isinstance(actual, list):
+            return f"[ambiguous] {' | '.join(actual)}"
         return actual
     if _UUID_RE.match(dir_name):
         return f"[dim]Session:[/] {dir_name[:8]}..."
@@ -111,7 +113,9 @@ class FileHistoryPane(Container):
     def _load(self) -> None:
         entries = get_file_history()
         project_paths = get_project_paths()
-        encoded_to_path = {encode_path(p): p for p in project_paths}
+        encoded_to_path: dict[str, list[str]] = {}
+        for path in project_paths:
+            encoded_to_path.setdefault(encode_path(path), []).append(path)
         if self.app.target_path:
             target_enc = self.app.target_encoded
             entries = [e for e in entries if e.dir_name == target_enc]

@@ -12,6 +12,30 @@ RECENT_DAYS_LIMIT = 14       # days kept in sessions-per-day
 SUMMARY_MAX_CHARS = 120      # session title/first-prompt truncation
 
 
+def strict_child(path: Path, root: Path, *, allow_symlink: bool = False) -> Path:
+    candidate = Path(path)
+    root = Path(root)
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+        raise ValueError(f"Path must be a strict child of {root}: {path}")
+    if not allow_symlink:
+        current = candidate
+        while current != root and current != current.parent:
+            if current.is_symlink():
+                raise ValueError(f"Refusing to operate on symlink: {path}")
+            current = current.parent
+    return resolved
+
+
+def validate_identifier(value: str, label: str = "identifier") -> str:
+    if not value or value in {".", ".."} or Path(value).name != value:
+        raise ValueError(f"Invalid {label}: {value!r}")
+    if any(ord(char) < 32 for char in value):
+        raise ValueError(f"Invalid {label}: {value!r}")
+    return value
+
+
 def format_bytes(size: int) -> str:
     """Format byte size to human-readable string."""
     if size < 1024:

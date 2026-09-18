@@ -314,7 +314,8 @@ class TestDashboardPeriodAndEditor:
 
         asyncio.run(run())
 
-    def test_instruction_file_editor_saves(self, tmp_path):
+    def test_instruction_file_editor_saves(self, monkeypatch, tmp_path):
+        _setup_fake_claude(monkeypatch, tmp_path)
         from asm.screens.file_editor import FileEditorScreen
         from textual.widgets import TextArea
 

@@ -26,6 +26,10 @@ from asm.models import CODEX_SESSIONS_DIR, PROJECTS_DIR
 _GREP_TIMEOUT = 15
 
 
+class SearchError(RuntimeError):
+    pass
+
+
 def normalize(text: str) -> str:
     """Casefold and strip all whitespace, so spacing never affects matching.
 
@@ -53,8 +57,7 @@ def _ripgrep_files(query: str, root: Path, glob: str) -> list[Path] | None:
     """Files under ``root`` matching ``glob`` whose body contains ``query``.
 
     Whitespace-insensitive, case-insensitive. Returns ``None`` when ripgrep is
-    unavailable so callers fall back to a Python scan; returns an empty list on
-    timeout / ripgrep error / empty query.
+    unavailable or fails so callers fall back to a Python scan.
     """
     rg = shutil.which("rg")
     if rg is None:
@@ -70,10 +73,10 @@ def _ripgrep_files(query: str, root: Path, glob: str) -> list[Path] | None:
             timeout=_GREP_TIMEOUT,
         )
     except (subprocess.SubprocessError, OSError):
-        return []
+        return None
     # exit 0 = matches, 1 = no matches (empty stdout), 2 = error.
     if proc.returncode not in (0, 1):
-        return []
+        return None
     return [Path(line) for line in proc.stdout.splitlines() if line]
 
 
@@ -89,10 +92,10 @@ def _python_grep_files(query: str, root: Path, glob: str) -> list[Path]:
                 with open(f, encoding="utf-8", errors="ignore") as fh:
                     if any(needle in normalize(line) for line in fh):
                         hits.append(f)
-            except OSError:
-                continue
-    except OSError:
-        pass
+            except OSError as exc:
+                raise SearchError(f"cannot read search file {f}: {exc}") from exc
+    except OSError as exc:
+        raise SearchError(f"cannot read search root {root}: {exc}") from exc
     return hits
 
 

@@ -19,6 +19,20 @@ from asm.utils import TOP_PROJECT_CHART_ROWS, format_bytes
 _TITLE_WIDTH = 60
 
 
+class AmbiguousSessionError(ValueError):
+    pass
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
 # ── helpers ─────────────────────────────────────────────────────────────
 
 
@@ -26,11 +40,19 @@ def _out_json(data) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
 
 
+def _result(args, payload: dict, message: str, *, error: bool = False) -> None:
+    if getattr(args, "json", False):
+        _out_json(payload)
+    else:
+        print(message, file=sys.stderr if error else sys.stdout)
+
+
 def _confirm(prompt: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
     try:
-        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+        print(f"{prompt} [y/N] ", end="", file=sys.stderr, flush=True)
+        return input().strip().lower() in ("y", "yes")
     except EOFError:
         return False
 
@@ -47,14 +69,26 @@ def _role(m: dict) -> str:
     return m.get("type") or m.get("role") or "?"
 
 
-def _find_claude_project_dir(session_id: str) -> str | None:
+def _find_claude_project_dir(session_id: str, project: str | None = None) -> str | None:
     """Encoded project dir name owning this session's JSONL, if any."""
-    from asm.models import PROJECTS_DIR
+    from asm.models import PROJECTS_DIR, encode_path
 
+    from asm.utils import validate_identifier
+
+    validate_identifier(session_id, "session id")
+    matches = []
     if PROJECTS_DIR.exists():
         for d in PROJECTS_DIR.iterdir():
             if d.is_dir() and (d / f"{session_id}.jsonl").exists():
-                return d.name
+                matches.append(d.name)
+    if project is not None:
+        matches = [name for name in matches if name == project or name == encode_path(project)]
+    if len(matches) > 1:
+        raise AmbiguousSessionError(
+            f"session id is present in multiple projects: {session_id} ({', '.join(sorted(matches))})"
+        )
+    if matches:
+        return matches[0]
     return None
 
 
@@ -90,7 +124,11 @@ def _sources(source: str) -> list[str]:
     srcs = []
     if source in ("all", "claude"):
         srcs.append("claude")
-    if source in ("all", "codex") and codex_data.is_available():
+    if source == "codex" and not codex_data.is_available():
+        raise RuntimeError("Codex source is unavailable")
+    if source == "all" and codex_data.is_available():
+        srcs.append("codex")
+    elif source == "codex":
         srcs.append("codex")
     return srcs
 
@@ -299,7 +337,7 @@ def cmd_preview(args) -> int:
 
     # Resolve the owning project dir up front so the direct JSONL path is used
     # (the SDK lookup returns [] for ids it can't find instead of raising).
-    project = args.project or _find_claude_project_dir(args.session_id)
+    project = args.project or _find_claude_project_dir(args.session_id, args.project)
 
     messages = claude_data.get_session_messages(args.session_id, project, args.limit)
     if not messages and codex_data.is_available():
@@ -388,12 +426,20 @@ def _exec_resume(argv: list[str], cwd: str | None, dry_run: bool) -> int:
         if not os.path.isdir(cwd):
             print(f"project dir not found: {cwd}", file=sys.stderr)
             return 1
-        os.chdir(cwd)
+        try:
+            os.chdir(cwd)
+        except OSError as exc:
+            print(f"failed to enter project dir {cwd}: {exc}", file=sys.stderr)
+            return 1
     print(f"↻ (cwd: {cwd or os.getcwd()})  {' '.join(argv)}", file=sys.stderr)
     if dry_run:
         return 0
-    os.execvp(argv[0], argv)  # replaces this process; never returns on success
-    return 1  # only reached if execvp fails
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as exc:
+        print(f"failed to execute {argv[0]}: {exc}", file=sys.stderr)
+        return 1
+    return 1
 
 
 def cmd_resume(args) -> int:
@@ -440,7 +486,7 @@ def cmd_clean(args) -> int:
                 ok += 1
             else:
                 fail += 1
-        print(f"trashed {ok}, failed {fail}")
+        _result(args, {"target": args.target, "trashed": ok, "failed": fail}, f"trashed {ok}, failed {fail}")
         return 0 if fail == 0 else 1
 
     if args.target == "orphaned":
@@ -451,7 +497,7 @@ def cmd_clean(args) -> int:
         if not _confirm(f"Trash {len(names)} orphaned session dir(s)?", args.yes):
             return 1
         ok, fail = cleaner.trash_sessions(names)
-        print(f"trashed {ok}, failed {fail}")
+        _result(args, {"target": args.target, "trashed": ok, "failed": fail}, f"trashed {ok}, failed {fail}")
         return 0 if fail == 0 else 1
 
     if args.target in ("debug", "todos"):
@@ -467,7 +513,7 @@ def cmd_clean(args) -> int:
         if not _confirm(f"Trash {len(names)} {label}?", args.yes):
             return 1
         ok, fail = prune()
-        print(f"trashed {ok}, failed {fail}")
+        _result(args, {"target": args.target, "trashed": ok, "failed": fail}, f"trashed {ok}, failed {fail}")
         return 0 if fail == 0 else 1
     return 1
 
@@ -508,8 +554,8 @@ def _backup_source_dirs_plugins():
 
 
 def _backup_source_dirs_codex():
-    from asm.models import CODEX_SESSIONS_DIR
-    return [CODEX_SESSIONS_DIR]
+    from asm.models import CODEX_DIR, CODEX_SESSIONS_DIR
+    return [CODEX_SESSIONS_DIR, *(CODEX_DIR / name for name in ("session_index.jsonl", "history.jsonl", "config.toml"))]
 
 
 # Directory-based backup types copy whole trees (possibly GBs) — the create
@@ -563,38 +609,42 @@ def cmd_backup(args) -> int:
                 return 1
         path = getattr(backup, _BACKUP_CREATORS[args.type])()
         if path:
-            print(path)
+            _result(args, {"action": "create", "type": args.type, "path": path}, path)
             return 0
-        print("backup failed", file=sys.stderr)
+        _result(args, {"action": "create", "type": args.type, "error": "backup failed"}, "backup failed", error=True)
         return 1
 
     if args.action == "restore":
         info = next((b for b in backup.list_backups() if b.path == args.path or b.name == args.path), None)
         if not info:
-            print(f"backup not found: {args.path}", file=sys.stderr)
+            _result(args, {"error": f"backup not found: {args.path}"}, f"backup not found: {args.path}", error=True)
             return 1
         if not _confirm(f"Restore {info.backup_type} backup '{info.name}'? Current data is replaced (rollback-safe)", args.yes):
             return 1
         result = getattr(backup, _BACKUP_RESTORERS[info.backup_type])(info.path)
         ok = result[0] if isinstance(result, tuple) else result
-        print("restored" if ok else "restore failed")
+        _result(args, {"action": "restore", "path": info.path, "restored": bool(ok)}, "restored" if ok else "restore failed", error=not ok)
         return 0 if ok else 1
 
     if args.action == "delete":
+        info = next((b for b in backup.list_backups() if b.path == args.path or b.name == args.path), None)
+        if not info:
+            _result(args, {"error": f"backup not found: {args.path}"}, f"backup not found: {args.path}", error=True)
+            return 1
         if not _confirm(f"Delete backup {args.path}?", args.yes):
             return 1
-        ok = backup.delete_backup(args.path)
-        print("deleted" if ok else "delete failed")
+        ok = backup.delete_backup(info.path)
+        _result(args, {"action": "delete", "path": info.path, "deleted": bool(ok)}, "deleted" if ok else "delete failed", error=not ok)
         return 0 if ok else 1
 
     if args.action == "export":
         out = backup.export_backup(args.path, dest_dir=args.dest)
-        print(out or "export failed")
+        _result(args, {"action": "export", "path": out} if out else {"action": "export", "error": "export failed"}, out or "export failed", error=not bool(out))
         return 0 if out else 1
 
     if args.action == "import":
         out = backup.import_backup(args.path)
-        print(out or "import failed")
+        _result(args, {"action": "import", "path": out} if out else {"action": "import", "error": "import failed"}, out or "import failed", error=not bool(out))
         return 0 if out else 1
     return 1
 
@@ -620,16 +670,18 @@ def cmd_recovery(args) -> int:
 
     if args.action == "restore":
         if not _confirm(f"Restore snapshot {args.id}?", args.yes):
+            _result(args, {"error": "cancelled"}, "cancelled", error=True)
             return 1
         ok, msg = recovery.restore_recovery_item(args.id, overwrite=args.overwrite)
-        print(msg)
+        _result(args, {"action": "restore", "id": args.id, "restored": bool(ok), "message": msg}, msg, error=not ok)
         return 0 if ok else 1
 
     if args.action == "delete":
         if not _confirm(f"Delete snapshot {args.id}?", args.yes):
+            _result(args, {"error": "cancelled"}, "cancelled", error=True)
             return 1
         ok = recovery.delete_recovery_item(args.id)
-        print("deleted" if ok else "delete failed")
+        _result(args, {"action": "delete", "id": args.id, "deleted": bool(ok)}, "deleted" if ok else "delete failed", error=not ok)
         return 0 if ok else 1
     return 1
 
@@ -640,12 +692,13 @@ def cmd_recovery(args) -> int:
 def cmd_trash(args) -> int:
     from asm.services import cleaner, codex_data
 
-    encoded_dir = _find_claude_project_dir(args.session_id)
+    encoded_dir = _find_claude_project_dir(args.session_id, args.project)
     if encoded_dir:
         if not _confirm(f"Trash Claude session {args.session_id} ({encoded_dir})?", args.yes):
+            _result(args, {"error": "cancelled"}, "cancelled", error=True)
             return 1
         ok = cleaner.trash_single_session_file(encoded_dir, args.session_id)
-        print("trashed" if ok else "trash failed")
+        _result(args, {"source": "claude", "session_id": args.session_id, "trashed": bool(ok)}, "trashed" if ok else "trash failed", error=not ok)
         return 0 if ok else 1
 
     if codex_data.is_available():
@@ -654,12 +707,13 @@ def cmd_trash(args) -> int:
         s = codex_data.find_session(args.session_id)
         if s:
             if not _confirm(f"Trash Codex session {args.session_id}?", args.yes):
+                _result(args, {"error": "cancelled"}, "cancelled", error=True)
                 return 1
             ok = cleaner.trash_codex_session(s.project_dir)  # rollout path
-            print("trashed" if ok else "trash failed")
+            _result(args, {"source": "codex", "session_id": args.session_id, "trashed": bool(ok)}, "trashed" if ok else "trash failed", error=not ok)
             return 0 if ok else 1
 
-    print(f"session not found: {args.session_id}", file=sys.stderr)
+    _result(args, {"error": f"session not found: {args.session_id}"}, f"session not found: {args.session_id}", error=True)
     return 1
 
 
@@ -672,16 +726,17 @@ def cmd_migrate(args) -> int:
         + (f" ({len(args.sessions)} selected)" if args.sessions else " (all)") + "?",
         args.yes,
     ):
+        _result(args, {"error": "cancelled"}, "cancelled", error=True)
         return 1
     result = migrate.migrate_sessions(
         source_path=args.src,
         target_path=args.dest,
         source_encoded=encode_path(args.src),
         target_encoded=encode_path(args.dest),
-        session_ids=args.sessions or None,
+        session_ids=args.sessions,
     )
-    print(f"{'ok' if result.success else 'failed'}: {result.sessions_copied} session(s) copied"
-          + (f" — {result.message}" if result.message else ""))
+    message = f"{'ok' if result.success else 'failed'}: {result.sessions_copied} session(s) copied" + (f" — {result.message}" if result.message else "")
+    _result(args, {"success": result.success, "sessions_copied": result.sessions_copied, "sessions_skipped": result.sessions_skipped, "message": result.message}, message, error=not result.success)
     return 0 if result.success else 1
 
 
@@ -730,27 +785,33 @@ def cmd_import(args) -> int:
 
     if args.action == "mcp":
         plan = agent_import.plan_mcp(_import_direction(args.to))
-        if args.json:
-            print(json.dumps({
-                "new": [s.name for s in plan.new],
-                "already_present": plan.already_present,
-                "unsupported": [{"name": n, "reason": r} for n, r in plan.unsupported],
-            }, ensure_ascii=False, indent=2))
-        else:
-            print(f"{plan.source} -> {plan.target}: {len(plan.new)} importable, "
-                  f"{len(plan.already_present)} already there")
-            for server in plan.new:
-                print(f"  + {server.name} ({server.transport})")
-            for name, reason in plan.unsupported:
-                print(f"  - {name}: {reason}")
+        plan_payload = {
+            "source": plan.source,
+            "target": plan.target,
+            "new": [s.name for s in plan.new],
+            "already_present": plan.already_present,
+            "unsupported": [{"name": n, "reason": r} for n, r in plan.unsupported],
+        }
         if args.dry_run or not plan.new:
+            if args.json:
+                _out_json(plan_payload)
+            else:
+                print(f"{plan.source} -> {plan.target}: {len(plan.new)} importable, "
+                      f"{len(plan.already_present)} already there")
+                for server in plan.new:
+                    print(f"  + {server.name} ({server.transport})")
+                for name, reason in plan.unsupported:
+                    print(f"  - {name}: {reason}")
             return 0
         if not _confirm(f"Import {len(plan.new)} MCP server(s) into {plan.target}?", args.yes):
             return 1
         result = agent_import.apply_mcp(plan)
-        print(f"imported {len(result.imported)}, failed {len(result.failed)}")
-        for name, reason in result.failed:
-            print(f"  ! {name}: {reason}", file=sys.stderr)
+        if args.json:
+            _out_json({**plan_payload, "imported": result.imported, "failed": result.failed, "backup_path": result.backup_path})
+        else:
+            print(f"imported {len(result.imported)}, failed {len(result.failed)}")
+            for name, reason in result.failed:
+                print(f"  ! {name}: {reason}", file=sys.stderr)
         return 1 if result.failed else 0
 
     if args.action == "list":
@@ -784,30 +845,39 @@ def cmd_import(args) -> int:
         target = "claude"
 
     if plan.skipped:
-        for _p, reason in plan.skipped:
-            print(f"skipped: {reason}", file=sys.stderr)
+        if args.json:
+            _out_json({"error": "session skipped", "skipped": plan.skipped})
+        else:
+            for _p, reason in plan.skipped:
+                print(f"skipped: {reason}", file=sys.stderr)
         return 1
     if plan.already_imported and not plan.new:
-        print(f"already imported into {target}; nothing to do")
+        _result(args, {"target": target, "already_imported": True}, f"already imported into {target}; nothing to do")
         return 0
 
     candidate = plan.new[0]
     origin = f"  [{path.parents[4].name}]" if source == "codex" and len(path.parents) > 4 else ""
-    print(f"{source} -> {target}: {candidate.turns} turns  cwd={candidate.cwd}{origin}")
-    print(f"  title: {candidate.title[:70]}")
+    if not args.json:
+        print(f"{source} -> {target}: {candidate.turns} turns  cwd={candidate.cwd}{origin}")
+        print(f"  title: {candidate.title[:70]}")
     if args.dry_run:
+        if args.json:
+            _out_json({"source": source, "target": target, "candidate": vars(candidate), "dry_run": True})
         return 0
     if not _confirm(f"Import this session into {target}?", args.yes):
         return 1
 
     result = (agent_import.apply_sessions_to_codex(plan) if target == "codex"
               else agent_import.apply_sessions_to_claude(plan))
-    for _src, new_id in result.imported:
-        print(f"imported as {new_id}")
-    for name, reason in result.failed:
-        print(f"  ! {name}: {reason}", file=sys.stderr)
-    if result.backup_path:
-        print(f"backup: {result.backup_path}")
+    if args.json:
+        _out_json({"source": source, "target": target, "imported": result.imported, "failed": result.failed, "backup_path": result.backup_path})
+    else:
+        for _src, new_id in result.imported:
+            print(f"imported as {new_id}")
+        for name, reason in result.failed:
+            print(f"  ! {name}: {reason}", file=sys.stderr)
+        if result.backup_path:
+            print(f"backup: {result.backup_path}")
     return 1 if result.failed else 0
 
 
@@ -831,7 +901,7 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     p = sub.add_parser("cost", help="cost/token usage stats")
     p.add_argument("--period", choices=["daily", "weekly", "monthly"], default="daily")
     p.add_argument("--source", choices=["all", "claude", "codex"], default="all")
-    p.add_argument("--limit", type=int, default=14, help="max period rows (default 14, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=14, help="max period rows (default 14, 0 = all)")
     _common(p)
     p.set_defaults(func=cmd_cost)
 
@@ -844,19 +914,19 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     p.add_argument("--project", help="limit to one project path")
     p.add_argument("--search", help="substring match on session title")
     p.add_argument("--source", choices=["all", "claude", "codex"], default="all")
-    p.add_argument("--limit", type=int, default=50, help="max rows (default 50, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=50, help="max rows (default 50, 0 = all)")
     _common(p)
     p.set_defaults(func=cmd_sessions)
 
     p = sub.add_parser("preview", help="print a session's conversation")
     p.add_argument("session_id")
     p.add_argument("--project", help="project path hint (faster lookup)")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--limit", type=_non_negative_int, default=50)
     _common(p)
     p.set_defaults(func=cmd_preview)
 
     p = sub.add_parser("artifacts", help="list artifacts published from Claude Code sessions")
-    p.add_argument("--limit", type=int, default=50, help="max rows (default 50, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=50, help="max rows (default 50, 0 = all)")
     _common(p)
     p.set_defaults(func=cmd_artifacts)
 
@@ -891,7 +961,9 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
 
     p = sub.add_parser("trash", help="trash one session by id (Claude or Codex)")
     p.add_argument("session_id")
+    p.add_argument("--project", help="Claude project path when a session id is duplicated")
     p.add_argument("--yes", action="store_true", help="skip confirmation")
+    _common(p)
     p.set_defaults(func=cmd_trash)
 
     p = sub.add_parser(
@@ -920,7 +992,7 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
             "\n"
             "Examples:\n"
             "  asm import home                        # active Codex data home\n"
-            "  asm import list --to claude            # what could move Codex -> Claude\n"
+            "  asm import list --to claude            # what could be copied Codex -> Claude\n"
             "  asm import session <id> --dry-run      # direction inferred from the id\n"
             "  asm import session <id> --yes\n"
             "  asm import mcp --to codex              # MCP servers Claude -> Codex\n"
@@ -933,7 +1005,7 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     p.add_argument("session_id", nargs="?", help="session id (action=session)")
     p.add_argument("--to", choices=["codex", "claude"], default="claude",
                    help="destination agent for mcp/list (default: claude); session infers it from the id")
-    p.add_argument("--limit", type=int, default=50, help="max rows for list (default 50, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=50, help="max rows for list (default 50, 0 = all)")
     p.add_argument("--dry-run", action="store_true", help="show what would happen, write nothing")
     p.add_argument("--yes", action="store_true", help="skip confirmation")
     _common(p)
@@ -942,16 +1014,23 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     p = sub.add_parser("migrate", help="copy sessions to another project path")
     p.add_argument("src", help="source project path")
     p.add_argument("dest", help="target project path")
-    p.add_argument("--sessions", nargs="*", help="session ids (default: all)")
+    p.add_argument("--sessions", nargs="+", help="session ids (default: all)")
     p.add_argument("--yes", action="store_true", help="skip confirmation")
+    _common(p)
     p.set_defaults(func=cmd_migrate)
 
 
 def run_cli(args) -> int:
     """Dispatch a parsed subcommand; returns the process exit code."""
     # Validate positional combos argparse can't express.
+    if args.command == "backup" and args.action in ("list", "create") and args.path:
+        print(f"backup {args.action} does not accept a path", file=sys.stderr)
+        return 2
     if args.command == "backup" and args.action in ("restore", "delete", "export", "import") and not args.path:
         print(f"backup {args.action} requires a path", file=sys.stderr)
+        return 2
+    if args.command == "recovery" and args.action == "list" and args.id:
+        print("recovery list does not accept an id", file=sys.stderr)
         return 2
     if args.command == "recovery" and args.action in ("restore", "delete") and not args.id:
         print(f"recovery {args.action} requires an id", file=sys.stderr)
@@ -959,4 +1038,14 @@ def run_cli(args) -> int:
     if args.command == "import" and args.action == "session" and not args.session_id:
         print("import session requires a session id", file=sys.stderr)
         return 2
-    return args.func(args)
+    if args.command == "import" and args.action != "session" and args.session_id:
+        print(f"import {args.action} does not accept a session id", file=sys.stderr)
+        return 2
+    try:
+        return args.func(args)
+    except Exception as exc:
+        if getattr(args, "json", False):
+            _out_json({"error": str(exc)})
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 1

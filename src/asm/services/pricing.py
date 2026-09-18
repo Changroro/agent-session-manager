@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -37,8 +38,10 @@ _RATES: dict[str, tuple[float, float, float, float]] = {
     "claude-opus-4-8": _OPUS,
     "claude-sonnet-4-5": _SONNET,
     "claude-sonnet-4-6": _SONNET,
+    "claude-sonnet-4": _SONNET,
     "claude-sonnet-5": _SONNET_5,
     "claude-haiku-4-5": _HAIKU,
+    "claude-haiku-4": _HAIKU,
     "claude-fable-5": _FABLE,
     "claude-mythos-5": _FABLE,
 }
@@ -58,6 +61,33 @@ _FETCH_TIMEOUT = 3.0
 
 _live_db: dict[str, dict] | None = None
 _rates_source = "bundled table"
+
+
+class PricingDataError(ValueError):
+    pass
+
+
+def _validate_live_db(data) -> dict[str, dict]:
+    if not isinstance(data, dict):
+        raise PricingDataError("pricing payload must be an object")
+    result: dict[str, dict] = {}
+    for key, entry in data.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        relevant = _relevant_entry(key)
+        if not relevant:
+            continue
+        for field in ("input_cost_per_token", "output_cost_per_token"):
+            value = entry.get(field)
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise PricingDataError(f"invalid {field} for pricing model {key}")
+        for field in ("cache_read_input_token_cost", "cache_creation_input_token_cost"):
+            if field in entry:
+                value = entry[field]
+                if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                    raise PricingDataError(f"invalid {field} for pricing model {key}")
+        result[key] = entry
+    return result
 
 
 def _cache_path() -> Path:
@@ -93,17 +123,17 @@ def load_live_rates(force: bool = False) -> str:
         age = None
     if age is not None and age < CACHE_MAX_AGE_SECONDS and not force:
         try:
-            _live_db = json.loads(cache.read_text())
+            _live_db = _validate_live_db(json.loads(cache.read_text()))
             _rates_source = f"LiteLLM (cached {max(int(age // 60), 0)}m ago)"
             return _rates_source
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError, PricingDataError) as exc:
             logger.warning("Unreadable pricing cache %s: %s", cache, exc)
 
     try:
         import urllib.request
         with urllib.request.urlopen(_LITELLM_URL, timeout=_FETCH_TIMEOUT) as resp:
             full = json.loads(resp.read().decode("utf-8"))
-        _live_db = {k: v for k, v in full.items() if _relevant_entry(k) and isinstance(v, dict)}
+        _live_db = _validate_live_db(full)
         _rates_source = "LiteLLM (live)"
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -116,10 +146,10 @@ def load_live_rates(force: bool = False) -> str:
 
     if cache.exists():
         try:
-            _live_db = json.loads(cache.read_text())
+            _live_db = _validate_live_db(json.loads(cache.read_text()))
             _rates_source = "LiteLLM (stale cache, offline)"
             return _rates_source
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, PricingDataError):
             pass
     _live_db = {}
     _rates_source = "bundled table (LiteLLM unreachable)"
@@ -135,6 +165,12 @@ def _live_lookup(keys: tuple[str, ...]) -> dict | None:
             isinstance(entry, dict)
             and "input_cost_per_token" in entry
             and "output_cost_per_token" in entry
+            and all(
+                isinstance(entry[field], (int, float))
+                and math.isfinite(entry[field])
+                and entry[field] >= 0
+                for field in ("input_cost_per_token", "output_cost_per_token")
+            )
         ):
             return entry
     return None
@@ -178,6 +214,8 @@ def _normalize(model: str) -> str:
 
 def _rates_for(model: str) -> tuple[float, float, float, float]:
     """Return (input, output, cache_read, cache_create) per-1M rates for a model."""
+    if not isinstance(model, str) or not model:
+        raise PricingDataError("Claude model id is required")
     name = _normalize(model)
     live = _live_claude_rates(name)
     if live is not None:
@@ -191,7 +229,7 @@ def _rates_for(model: str) -> tuple[float, float, float, float]:
         return _FABLE
     if "haiku" in name:
         return _HAIKU
-    return _SONNET
+    raise PricingDataError(f"unknown Claude model: {model}")
 
 
 def display_model(model: str) -> str:

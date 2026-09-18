@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,24 +76,28 @@ def migrate_legacy_data_dir() -> bool:
     doesn't strand the old backups. Returns True if anything was migrated. Safe to
     call on every startup (no-op once the legacy dirs are gone).
     """
-    import shutil
-
     moved = False
+    failures: list[str] = []
     for legacy in LEGACY_APP_DATA_DIRS:
         if not legacy.exists():
             continue
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            for item in legacy.iterdir():
-                dest = APP_DATA_DIR / item.name
-                if dest.exists():
-                    continue  # don't overwrite newer data
+        for item in legacy.iterdir():
+            dest = APP_DATA_DIR / item.name
+            if dest.exists():
+                continue
+            try:
                 shutil.move(str(item), str(dest))
                 moved = True
+            except OSError as exc:
+                failures.append(f"{item}: {exc}")
+        try:
             if not any(legacy.iterdir()):
                 legacy.rmdir()
-        except OSError:
-            continue
+        except OSError as exc:
+            failures.append(f"{legacy}: {exc}")
+    if failures:
+        raise OSError("Legacy app-data migration failed: " + "; ".join(failures))
     return moved
 
 

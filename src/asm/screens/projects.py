@@ -27,6 +27,7 @@ from asm.services.claude_data import (
     get_sessions,
     load_claude_json,
     remove_project_from_json,
+    project_paths_for_encoded,
 )
 from asm.i18n import t
 from asm.services.cleaner import trash_sessions, trash_single_session_file
@@ -194,6 +195,14 @@ class ProjectsPane(Container):
         self._project_costs = project_costs or {}
         self._session_cache = None
         self._session_cache_gen += 1
+        if self._content_search_timer is not None:
+            self._content_search_timer.stop()
+            self._content_search_timer = None
+        self._content_search_gen += 1
+        self._content_claude_ids = None
+        self._content_codex_by_cwd = {}
+        if self._filter_query:
+            self._schedule_content_search()
         self._build_tree_from_state()
 
     def _build_tree_from_state(self) -> None:
@@ -428,6 +437,9 @@ class ProjectsPane(Container):
         path = getattr(self, "_selected_project_path", None)
         if path:
             encoded = encode_path(path)
+            if len(project_paths_for_encoded(encoded)) > 1:
+                self._render_detail_actions()
+                return
             sd = PROJECTS_DIR / encoded
             session_count = len(list(sd.glob("*.jsonl"))) if sd.exists() else 0
             self._render_detail_actions(
@@ -523,6 +535,11 @@ class ProjectsPane(Container):
         """Add a project node that can be expanded to show sessions."""
         status = "[green]O[/]" if p.exists else "[red]X[/]"
         encoded = encode_path(p.path)
+        ambiguous = project_paths_for_encoded(encoded)
+        if len(ambiguous) > 1:
+            label = f"[yellow]ambiguous[/] {display_name}"
+            parent.add_leaf(label, data=("project", p.path))
+            return
         session_dir = PROJECTS_DIR / encoded
         session_count = len(list(session_dir.glob("*.jsonl"))) if session_dir.exists() else 0
         matched_sessions = self._session_match_map.get(p.path)
@@ -607,6 +624,12 @@ class ProjectsPane(Container):
             self._selected_session = None
             self._selected_session_node = None
             encoded = encode_path(path)
+            if len(project_paths_for_encoded(encoded)) > 1:
+                self._render_detail_actions()
+                p = self._project_map.get(path)
+                if p:
+                    self._show_project_detail(p, 0)
+                return
             session_dir = PROJECTS_DIR / encoded
             session_count = len(list(session_dir.glob("*.jsonl"))) if session_dir.exists() else 0
             self._render_detail_actions(
@@ -744,9 +767,9 @@ class ProjectsPane(Container):
 
         if source == "codex":
             from asm.services import codex_data
-            messages = codex_data.get_session_messages(session_id, project_dir, limit=100_000)
+            messages = codex_data.get_session_messages(session_id, project_dir, limit=0)
         else:
-            messages = get_session_messages(session_id, project_dir=project_dir, limit=100_000)
+            messages = get_session_messages(session_id, project_dir=project_dir, limit=0)
         if not messages:
             self.app.call_from_thread(self.app.notify, t("proj.no_messages"), severity="warning")
             return
@@ -755,6 +778,10 @@ class ProjectsPane(Container):
             out_dir = Path.home()
         stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
         out = out_dir / f"asm-session-{session_id[:8]}-{stamp}.md"
+        counter = 1
+        while out.exists():
+            out = out_dir / f"asm-session-{session_id[:8]}-{stamp}_{counter}.md"
+            counter += 1
         lines = [f"# Session {session_id}", f"_source: {source} · exported by asm_", ""]
         role_names = {"user": "User", "assistant": "Assistant", "meta": "Meta"}
         for m in messages:
@@ -762,7 +789,9 @@ class ProjectsPane(Container):
             lines.append(m.get("content", ""))
             lines.append("")
         try:
-            out.write_text("\n".join(lines))
+            tmp = out.with_name(f".{out.name}.tmp")
+            tmp.write_text("\n".join(lines), encoding="utf-8")
+            tmp.replace(out)
         except OSError as exc:
             self.app.call_from_thread(self.app.notify, str(exc), severity="error")
             return
@@ -955,7 +984,12 @@ class ProjectsPane(Container):
 
     def _do_remove_config(self, path: str) -> None:
         def _work():
-            create_config_backup()
+            backup_path = create_config_backup()
+            from asm.services import backup
+
+            if backup.CLAUDE_JSON.exists() and not backup_path:
+                self.app.call_from_thread(self.app.notify, t("proj.config_fail"), severity="error")
+                return
             if remove_project_from_json(path):
                 self.app.call_from_thread(self.app.notify, t("proj.config_removed", path=path))
                 self.app.call_from_thread(self.refresh_data)

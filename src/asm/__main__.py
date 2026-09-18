@@ -57,7 +57,11 @@ def main():
     add_cli_subparsers(parser)
     args = parser.parse_args()
 
-    migrate_legacy_data_dir()
+    try:
+        migrate_legacy_data_dir()
+    except OSError as exc:
+        print(f"legacy data migration failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
     if getattr(args, "command", None):
         sys.exit(run_cli(args))

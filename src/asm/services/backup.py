@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
+import posixpath
 import shutil
 import sys
 import tarfile
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +17,7 @@ from send2trash import send2trash
 
 from asm.models import (
     BACKUP_BASE_DIR,
+    APP_DATA_DIR,
     CLAUDE_DIR,
     CLAUDE_JSON,
     CODEX_DIR,
@@ -23,6 +27,7 @@ from asm.models import (
     SKILLS_DIR,
     BackupInfo,
 )
+from asm.utils import strict_child
 
 logger = logging.getLogger(__name__)
 
@@ -34,33 +39,37 @@ SETTINGS_FILES = [
 ]
 
 _SYMLINKS_ON = sys.platform != "win32"
+_DEFAULT_APP_DATA_DIR = APP_DATA_DIR
+
+
+def _app_data_dir() -> Path:
+    if APP_DATA_DIR == _DEFAULT_APP_DATA_DIR:
+        from asm import models
+
+        return models.APP_DATA_DIR
+    return APP_DATA_DIR
 
 
 def _validate_backup_path(path: Path) -> None:
     """Ensure path is within the backup directory."""
-    resolved = path.resolve()
-    if not resolved.is_relative_to(BACKUP_BASE_DIR.resolve()):
-        raise ValueError(f"Backup path outside allowed directory: {path}")
+    strict_child(path, BACKUP_BASE_DIR)
 
 
 def _ensure_backup_dir() -> Path:
     """Ensure backup directory exists (private — backups may hold OAuth tokens)."""
     BACKUP_BASE_DIR.mkdir(parents=True, exist_ok=True)
-    # ~/.asm tree may contain ~/.claude.json (OAuth tokens) — keep it owner-only.
     for d in (BACKUP_BASE_DIR.parent, BACKUP_BASE_DIR):
-        try:
-            d.chmod(0o700)
-        except OSError:
-            pass
+        d.chmod(0o700)
+        if os.name != "nt" and d.stat().st_mode & 0o777 != 0o700:
+            raise OSError(f"Could not restrict backup directory: {d}")
     return BACKUP_BASE_DIR
 
 
 def _restrict(path: Path) -> None:
-    """Best-effort owner-only (0600) on a possibly-sensitive backup file."""
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    """Set owner-only permissions on a sensitive backup file."""
+    path.chmod(0o600)
+    if os.name != "nt" and path.stat().st_mode & 0o777 != 0o600:
+        raise OSError(f"Could not restrict backup file: {path}")
 
 
 def _dir_size(path: Path) -> int:
@@ -68,16 +77,121 @@ def _dir_size(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+def _copytree(source: Path, destination: Path) -> None:
+    if source.is_symlink():
+        raise OSError(f"Backup source cannot be a symlink: {source}")
+    broken = detect_broken_symlinks(source)
+    if broken:
+        raise OSError(f"Broken symlink in backup source {source}: {broken[0]}")
+    shutil.copytree(
+        str(source),
+        str(destination),
+        symlinks=_SYMLINKS_ON,
+    )
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _source_exists(paths: list[Path]) -> bool:
+    for path in paths:
+        if path.is_symlink() or path.is_file():
+            return True
+        if path.is_dir():
+            try:
+                if any(path.iterdir()):
+                    return True
+            except OSError as exc:
+                raise OSError(f"cannot inspect backup source: {path}: {exc}") from exc
+    return False
+
+
 def _is_safe_tar_member(member: tarfile.TarInfo) -> bool:
     """Return True when an archive member is safe to extract."""
     member_path = Path(member.name)
     if member_path.is_absolute() or ".." in member_path.parts:
         return False
-    if member.issym() or member.islnk():
+    if member.islnk():
         return False
     if member.isdev():
         return False
+    if member.issym():
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), member.linkname))
+        if member.linkname.startswith("/") or target == ".." or target.startswith("../"):
+            return False
     return True
+
+
+_MAX_ARCHIVE_MEMBERS = 10000
+_MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_ARCHIVE_RATIO = 1000
+
+
+def _validated_archive_members(tar: tarfile.TarFile, archive_size: int) -> tuple[list[tarfile.TarInfo], str]:
+    members: list[tarfile.TarInfo] = []
+    names: set[str] = set()
+    top: str | None = None
+    total = 0
+    for member in tar:
+        if len(members) >= _MAX_ARCHIVE_MEMBERS:
+            raise ValueError("Archive contains too many members")
+        if not member.name or "\x00" in member.name or not _is_safe_tar_member(member):
+            raise ValueError(f"Unsafe path in archive: {member.name}")
+        normalized = posixpath.normpath(member.name)
+        if normalized != member.name or normalized in {"", "."}:
+            raise ValueError(f"Unsafe path in archive: {member.name}")
+        if member.name in names:
+            raise ValueError(f"Duplicate path in archive: {member.name}")
+        names.add(member.name)
+        member_top = member.name.split("/", 1)[0]
+        if top is None:
+            top = member_top
+        elif member_top != top:
+            raise ValueError("Archive must contain one top-level backup")
+        total += max(member.size, 0)
+        if total > _MAX_ARCHIVE_BYTES:
+            raise ValueError("Archive expands beyond the supported size")
+        members.append(member)
+    if not members or top is None:
+        raise ValueError("Archive is empty")
+    if archive_size and total > archive_size * _MAX_ARCHIVE_RATIO:
+        raise ValueError("Archive compression ratio is too high")
+    return members, top
+
+
+def _extract_archive_safely(
+    tar: tarfile.TarFile, members: list[tarfile.TarInfo], destination: Path
+) -> None:
+    created: set[Path] = set()
+    for member in members:
+        target = destination / Path(*member.name.split("/"))
+        if member.isdir():
+            strict_child(target, destination)
+            if target.exists() or target.is_symlink():
+                if not target.is_dir() or target.is_symlink():
+                    raise ValueError(f"Archive path collision: {member.name}")
+                continue
+            target.mkdir(parents=True)
+            created.add(target)
+            continue
+        strict_child(target, destination)
+        if target.exists() or target.is_symlink():
+            raise ValueError(f"Archive path collision: {member.name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if member.issym():
+            target.symlink_to(member.linkname)
+        elif member.isfile():
+            source = tar.extractfile(member)
+            if source is None:
+                raise ValueError(f"Archive member has no data: {member.name}")
+            with source, target.open("xb") as output:
+                shutil.copyfileobj(source, output)
+        else:
+            raise ValueError(f"Unsupported archive member: {member.name}")
 
 
 # ── Create backups ───────────────────────────────────────────────
@@ -87,39 +201,43 @@ def create_config_backup() -> str | None:
     """Create a backup of .claude.json. Returns backup path or None."""
     if not CLAUDE_JSON.exists():
         return None
-    backup_dir = _ensure_backup_dir() / "config"
-    backup_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    dest = backup_dir / f".claude-{timestamp}.json"
+    backup_dir = None
+    dest = None
     try:
+        backup_dir = _ensure_backup_dir() / "config"
+        backup_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        dest = backup_dir / f".claude-{timestamp}.json"
         shutil.copy2(str(CLAUDE_JSON), str(dest))
-        _restrict(dest)  # contains OAuth tokens
+        _restrict(dest)
         return str(dest)
-    except OSError as e:
+    except (OSError, shutil.Error) as e:
         logger.warning("Failed to create config backup: %s", e)
+        if dest is not None and dest.exists():
+            dest.unlink()
         return None
 
 
 def create_full_backup() -> str | None:
     """Create a full backup of .claude directory and .claude.json."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    backup_dir = _ensure_backup_dir() / f"full-{timestamp}"
-
+    backup_dir = None
     try:
+        backup_dir = _ensure_backup_dir() / f"full-{timestamp}"
+        if not _source_exists([CLAUDE_DIR, CLAUDE_JSON]):
+            return None
+        backup_dir.mkdir(parents=True, exist_ok=True)
         if CLAUDE_DIR.exists():
-            shutil.copytree(
-                str(CLAUDE_DIR),
-                str(backup_dir / ".claude"),
-                symlinks=_SYMLINKS_ON,
-                ignore_dangling_symlinks=True,
-            )
+            _copytree(CLAUDE_DIR, backup_dir / ".claude")
         if CLAUDE_JSON.exists():
             json_dest = backup_dir / ".claude.json"
             shutil.copy2(str(CLAUDE_JSON), str(json_dest))
-            _restrict(json_dest)  # contains OAuth tokens
+            _restrict(json_dest)
         return str(backup_dir)
-    except OSError as e:
+    except (OSError, shutil.Error) as e:
         logger.warning("Failed to create full backup: %s", e)
+        if backup_dir is not None and backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
         return None
 
 
@@ -129,66 +247,59 @@ def create_settings_backup() -> str | None:
     if not existing:
         return None
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    backup_dir = _ensure_backup_dir() / f"settings-{timestamp}"
+    backup_dir = None
     try:
+        backup_dir = _ensure_backup_dir() / f"settings-{timestamp}"
         backup_dir.mkdir(parents=True, exist_ok=True)
         for f in existing:
             shutil.copy2(str(f), str(backup_dir / f.name))
+            _restrict(backup_dir / f.name)
         return str(backup_dir)
-    except OSError as e:
+    except (OSError, shutil.Error) as e:
         logger.warning("Failed to create settings backup: %s", e)
-        if backup_dir.exists():
+        if backup_dir is not None and backup_dir.exists():
             shutil.rmtree(str(backup_dir), ignore_errors=True)
         return None
 
 
 def create_plugins_backup() -> str | None:
     """Backup plugins/ and skills/ directories (including symlinks)."""
-    if not PLUGINS_DIR.exists() and not SKILLS_DIR.exists():
+    if not _source_exists([PLUGINS_DIR, SKILLS_DIR]):
         return None
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    backup_dir = _ensure_backup_dir() / f"plugins-{timestamp}"
+    backup_dir = None
     try:
+        backup_dir = _ensure_backup_dir() / f"plugins-{timestamp}"
         backup_dir.mkdir(parents=True, exist_ok=True)
         if PLUGINS_DIR.exists():
-            shutil.copytree(
-                str(PLUGINS_DIR),
-                str(backup_dir / "plugins"),
-                symlinks=_SYMLINKS_ON,
-                ignore_dangling_symlinks=True,
-            )
+            _copytree(PLUGINS_DIR, backup_dir / "plugins")
         if SKILLS_DIR.exists():
-            shutil.copytree(
-                str(SKILLS_DIR),
-                str(backup_dir / "skills"),
-                symlinks=_SYMLINKS_ON,
-                ignore_dangling_symlinks=True,
-            )
+            _copytree(SKILLS_DIR, backup_dir / "skills")
         return str(backup_dir)
-    except OSError as e:
+    except (OSError, shutil.Error) as e:
         logger.warning("Failed to create plugins backup: %s", e)
-        if backup_dir.exists():
+        if backup_dir is not None and backup_dir.exists():
             shutil.rmtree(str(backup_dir), ignore_errors=True)
         return None
 
 
 def create_sessions_backup() -> str | None:
     """Backup projects/ directory (session data)."""
-    if not PROJECTS_DIR.exists():
+    if not _source_exists([PROJECTS_DIR]):
         return None
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    backup_dir = _ensure_backup_dir() / f"sessions-{timestamp}"
+    backup_dir = None
     try:
-        shutil.copytree(
-            str(PROJECTS_DIR),
-            str(backup_dir / "projects"),
-            symlinks=_SYMLINKS_ON,
-            ignore_dangling_symlinks=True,
-        )
+        backup_dir = _ensure_backup_dir() / f"sessions-{timestamp}"
+        _copytree(PROJECTS_DIR, backup_dir / "projects")
+        import_record = _app_data_dir() / "codex_session_imports.json"
+        if import_record.exists():
+            shutil.copy2(str(import_record), str(backup_dir / import_record.name))
+            _restrict(backup_dir / import_record.name)
         return str(backup_dir)
-    except OSError as e:
+    except (OSError, shutil.Error) as e:
         logger.warning("Failed to create sessions backup: %s", e)
-        if backup_dir.exists():
+        if backup_dir is not None and backup_dir.exists():
             shutil.rmtree(str(backup_dir), ignore_errors=True)
         return None
 
@@ -198,25 +309,26 @@ def create_codex_backup() -> str | None:
 
     Excludes the large regenerable caches (sqlite logs, generated_images).
     """
-    if not CODEX_SESSIONS_DIR.exists():
+    if not _source_exists([CODEX_SESSIONS_DIR]):
         return None
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    backup_dir = _ensure_backup_dir() / f"codex-{timestamp}"
+    backup_dir = None
     try:
-        shutil.copytree(
-            str(CODEX_SESSIONS_DIR),
-            str(backup_dir / "sessions"),
-            symlinks=_SYMLINKS_ON,
-            ignore_dangling_symlinks=True,
-        )
+        backup_dir = _ensure_backup_dir() / f"codex-{timestamp}"
+        _copytree(CODEX_SESSIONS_DIR, backup_dir / "sessions")
         for name in ("session_index.jsonl", "history.jsonl", "config.toml"):
             f = CODEX_DIR / name
             if f.exists():
                 shutil.copy2(str(f), str(backup_dir / name))
+                _restrict(backup_dir / name)
+        import_record = CODEX_DIR / "external_agent_session_imports.json"
+        if import_record.exists():
+            shutil.copy2(str(import_record), str(backup_dir / import_record.name))
+            _restrict(backup_dir / import_record.name)
         return str(backup_dir)
-    except OSError as e:
+    except (OSError, shutil.Error) as e:
         logger.warning("Failed to create codex backup: %s", e)
-        if backup_dir.exists():
+        if backup_dir is not None and backup_dir.exists():
             shutil.rmtree(str(backup_dir), ignore_errors=True)
         return None
 
@@ -226,15 +338,26 @@ def create_codex_backup() -> str | None:
 
 def list_backups() -> list[BackupInfo]:
     """List all available backups."""
-    backup_dir = _ensure_backup_dir()
+    backup_dir = BACKUP_BASE_DIR
+    if not backup_dir.exists():
+        return []
     result = []
 
     # Config backups (single files in config/)
     config_dir = backup_dir / "config"
     if config_dir.exists():
-        for f in sorted(config_dir.iterdir(), reverse=True):
+        try:
+            config_files = sorted(config_dir.iterdir(), reverse=True)
+        except OSError as exc:
+            logger.warning("Skipping inaccessible config backups: %s", exc)
+            config_files = []
+        for f in config_files:
             if f.suffix == ".json":
-                stat = f.stat()
+                try:
+                    stat = f.stat()
+                except OSError as exc:
+                    logger.warning("Skipping backup with unavailable metadata %s: %s", f, exc)
+                    continue
                 result.append(
                     BackupInfo(
                         name=f"[config] {f.name}",
@@ -253,13 +376,21 @@ def list_backups() -> list[BackupInfo]:
         "sessions-": "sessions",
         "codex-": "codex",
     }
-    for d in sorted(backup_dir.iterdir(), reverse=True):
+    try:
+        backup_entries = sorted(backup_dir.iterdir(), reverse=True)
+    except OSError as exc:
+        raise OSError(f"cannot list backups: {backup_dir}: {exc}") from exc
+    for d in backup_entries:
         if not d.is_dir():
             continue
         for prefix, btype in _TYPE_PREFIXES.items():
             if d.name.startswith(prefix):
-                size = _dir_size(d)
-                stat = d.stat()
+                try:
+                    size = _dir_size(d)
+                    stat = d.stat()
+                except OSError as exc:
+                    logger.warning("Skipping backup with unavailable metadata %s: %s", d, exc)
+                    break
                 result.append(
                     BackupInfo(
                         name=f"[{btype}] {d.name}",
@@ -309,22 +440,70 @@ def detect_broken_symlinks(path: Path) -> list[str]:
 # ── Restore backups ──────────────────────────────────────────────
 
 
+def _read_json_object(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid JSON backup: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"JSON backup must contain an object: {path}")
+    return data
+
+
+def _validate_restore_source(src: Path, backup_type: str) -> None:
+    _validate_backup_path(src)
+    if backup_type == "config":
+        if not src.is_file():
+            raise ValueError(f"Config backup is not a file: {src}")
+        _read_json_object(src)
+        return
+    if backup_type == "full":
+        if not (src / ".claude").is_dir() and not (src / ".claude.json").is_file():
+            raise ValueError(f"Full backup has no restorable data: {src}")
+        if (src / ".claude.json").exists():
+            _read_json_object(src / ".claude.json")
+        return
+    required = {
+        "settings": ("settings.json", "settings.local.json", "keybindings.json"),
+        "plugins": ("plugins", "skills"),
+        "sessions": ("projects",),
+        "codex": ("sessions",),
+    }[backup_type]
+    if not any((src / name).exists() for name in required):
+        raise ValueError(f"Backup has no restorable {backup_type} data: {src}")
+    if backup_type == "settings":
+        for name in required:
+            path = src / name
+            if path.exists():
+                _read_json_object(path)
+
+
+def _require_safety_backup(create, sources: list[Path]) -> str | None:
+    if not _source_exists(sources):
+        return None
+    path = create()
+    if not path:
+        raise OSError("Safety backup could not be created")
+    return path
+
+
 def restore_config_backup(backup_path: str) -> bool:
     """Restore .claude.json from a backup file."""
     src = Path(backup_path)
     if not src.exists():
         return False
     try:
-        _validate_backup_path(src)
-        # Read the backup up front: the safety backup below can land on the same
-        # timestamped filename as ``src`` (second resolution) and overwrite it
-        # with the current — possibly broken — config before we copy it back.
+        _validate_restore_source(src, "config")
         payload = src.read_bytes()
-        create_config_backup()
-        CLAUDE_JSON.write_bytes(payload)
+        _require_safety_backup(create_config_backup, [CLAUDE_JSON])
+        temp = CLAUDE_JSON.with_name(f".{CLAUDE_JSON.name}.restoring")
+        temp.write_bytes(payload)
+        os.replace(temp, CLAUDE_JSON)
         return True
     except (OSError, ValueError) as e:
         logger.warning("Failed to restore config backup: %s", e)
+        if 'temp' in locals() and temp.exists():
+            temp.unlink()
         return False
 
 
@@ -337,68 +516,59 @@ def restore_full_backup(backup_path: str) -> bool:
     src = Path(backup_path)
     if not src.exists():
         return False
+    old_dir = CLAUDE_DIR.with_name(".claude.restore-old")
+    old_json = CLAUDE_JSON.with_name(f".{CLAUDE_JSON.name}.restore-old")
+    stage_dir = CLAUDE_DIR.with_name(".claude.restoring")
+    stage_json = CLAUDE_JSON.with_name(f".{CLAUDE_JSON.name}.restoring")
+    moved_dir = moved_json = installed_dir = installed_json = False
     try:
-        _validate_backup_path(src)
-        safety = create_full_backup()
-        if safety is None:
-            return False
+        _validate_restore_source(src, "full")
+        _require_safety_backup(create_full_backup, [CLAUDE_DIR, CLAUDE_JSON])
 
         claude_backup = src / ".claude"
         json_backup = src / ".claude.json"
-        temp_dir = CLAUDE_DIR.with_name(".claude.restoring")
-        temp_json = CLAUDE_JSON.with_name(f"{CLAUDE_JSON.name}.restoring")
-
-        # Phase 1: Prepare .claude.json copy to temp (validate before touching anything)
+        for path in (old_dir, old_json, stage_dir, stage_json):
+            if path.exists() or path.is_symlink():
+                _remove_path(path)
         if json_backup.exists():
-            try:
-                shutil.copy2(str(json_backup), str(temp_json))
-            except OSError:
-                if temp_json.exists():
-                    temp_json.unlink()
-                raise
-
-        # Phase 2: Replace .claude directory with rename+rollback
+            shutil.copy2(str(json_backup), str(stage_json))
         if claude_backup.exists():
-            if temp_dir.exists():
-                shutil.rmtree(str(temp_dir))
-            if CLAUDE_DIR.exists():
-                CLAUDE_DIR.rename(temp_dir)
-            try:
-                shutil.copytree(
-                    str(claude_backup), str(CLAUDE_DIR),
-                    symlinks=_SYMLINKS_ON, ignore_dangling_symlinks=True,
-                )
-            except (OSError, shutil.Error):
-                # Rollback directory
-                if temp_dir.exists():
-                    if CLAUDE_DIR.exists():
-                        try:
-                            shutil.rmtree(str(CLAUDE_DIR))
-                        except OSError as rmtree_err:
-                            logger.error(
-                                "Rollback: failed to remove partial .claude dir: %s. "
-                                "Original data preserved at %s",
-                                rmtree_err, temp_dir,
-                            )
-                            if temp_json.exists():
-                                temp_json.unlink()
-                            raise
-                    temp_dir.rename(CLAUDE_DIR)
-                if temp_json.exists():
-                    temp_json.unlink()
-                raise
+            _copytree(claude_backup, stage_dir)
 
-        # Phase 3: Atomically move .claude.json (rename is atomic on same filesystem)
-        if temp_json.exists():
-            os.replace(temp_json, CLAUDE_JSON)
-
-        # Phase 4: Cleanup
-        if temp_dir.exists():
-            shutil.rmtree(str(temp_dir))
+        if CLAUDE_DIR.exists() or CLAUDE_DIR.is_symlink():
+            CLAUDE_DIR.rename(old_dir)
+            moved_dir = True
+        if stage_dir.exists():
+            stage_dir.rename(CLAUDE_DIR)
+            installed_dir = True
+        if CLAUDE_JSON.exists() or CLAUDE_JSON.is_symlink():
+            CLAUDE_JSON.rename(old_json)
+            moved_json = True
+        if stage_json.exists():
+            os.replace(stage_json, CLAUDE_JSON)
+            installed_json = True
+        if moved_dir:
+            _remove_path(old_dir)
+        if moved_json:
+            _remove_path(old_json)
 
         return True
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, shutil.Error) as e:
         logger.warning("Failed to restore full backup: %s", e)
+        try:
+            if installed_dir and (CLAUDE_DIR.exists() or CLAUDE_DIR.is_symlink()):
+                _remove_path(CLAUDE_DIR)
+            if moved_dir and (old_dir.exists() or old_dir.is_symlink()):
+                old_dir.rename(CLAUDE_DIR)
+            if installed_json and (CLAUDE_JSON.exists() or CLAUDE_JSON.is_symlink()):
+                _remove_path(CLAUDE_JSON)
+            if moved_json and (old_json.exists() or old_json.is_symlink()):
+                old_json.rename(CLAUDE_JSON)
+            for path in (stage_dir, stage_json):
+                if path.exists() or path.is_symlink():
+                    _remove_path(path)
+        except OSError as rollback_error:
+            logger.error("Full restore rollback failed: %s", rollback_error)
         return False
 
 
@@ -416,10 +586,7 @@ def _replace_dir_with_rollback(src_dir: Path, dest_dir: Path) -> None:
         dest_dir.rename(temp)
         moved = True
     try:
-        shutil.copytree(
-            str(src_dir), str(dest_dir),
-            symlinks=_SYMLINKS_ON, ignore_dangling_symlinks=True,
-        )
+        _copytree(src_dir, dest_dir)
     except (OSError, shutil.Error):
         if moved:
             if dest_dir.exists():
@@ -427,7 +594,42 @@ def _replace_dir_with_rollback(src_dir: Path, dest_dir: Path) -> None:
             temp.rename(dest_dir)
         raise
     if moved and temp.exists():
-        shutil.rmtree(str(temp), ignore_errors=True)
+        shutil.rmtree(str(temp))
+
+
+def _restore_files_with_rollback(files: list[tuple[Path, Path]]) -> None:
+    staged: list[tuple[Path, Path]] = []
+    old: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    try:
+        for index, (source, destination) in enumerate(files):
+            stage = destination.with_name(f".{destination.name}.restoring-{index}")
+            if stage.exists() or stage.is_symlink():
+                _remove_path(stage)
+            shutil.copy2(str(source), str(stage))
+            staged.append((stage, destination))
+        for index, (_stage, destination) in enumerate(staged):
+            old_path = destination.with_name(f".{destination.name}.restore-old-{index}")
+            if old_path.exists() or old_path.is_symlink():
+                _remove_path(old_path)
+            if destination.exists() or destination.is_symlink():
+                destination.rename(old_path)
+                old.append((old_path, destination))
+            _stage.rename(destination)
+            installed.append(destination)
+        for old_path, _destination in old:
+            _remove_path(old_path)
+    except (OSError, shutil.Error):
+        for destination in installed:
+            if destination.exists() or destination.is_symlink():
+                _remove_path(destination)
+        for old_path, destination in reversed(old):
+            if old_path.exists() or old_path.is_symlink():
+                old_path.rename(destination)
+        for stage, _destination in staged:
+            if stage.exists() or stage.is_symlink():
+                _remove_path(stage)
+        raise
 
 
 def restore_settings_backup(backup_path: str) -> bool:
@@ -436,15 +638,17 @@ def restore_settings_backup(backup_path: str) -> bool:
     if not src.exists():
         return False
     try:
-        _validate_backup_path(src)
-        # Safety: backup current settings first
-        create_settings_backup()
-        for f in src.iterdir():
-            if f.is_file() and f.suffix == ".json":
-                dest = CLAUDE_DIR / f.name
-                shutil.copy2(str(f), str(dest))
+        _validate_restore_source(src, "settings")
+        files = [
+            (src / name, CLAUDE_DIR / name)
+            for name in ("settings.json", "settings.local.json", "keybindings.json")
+            if (src / name).is_file()
+        ]
+        _require_safety_backup(create_settings_backup, SETTINGS_FILES)
+        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        _restore_files_with_rollback(files)
         return True
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, shutil.Error) as e:
         logger.warning("Failed to restore settings backup: %s", e)
         return False
 
@@ -459,18 +663,49 @@ def restore_plugins_backup(backup_path: str) -> tuple[bool, list[str]]:
     if not src.exists():
         return False, []
     try:
-        _validate_backup_path(src)
-        # Safety: backup current plugins first
-        create_plugins_backup()
+        _validate_restore_source(src, "plugins")
+        _require_safety_backup(create_plugins_backup, [PLUGINS_DIR, SKILLS_DIR])
 
         plugins_src = src / "plugins"
         skills_src = src / "skills"
 
-        if plugins_src.exists():
-            _replace_dir_with_rollback(plugins_src, PLUGINS_DIR)
-
-        if skills_src.exists():
-            _replace_dir_with_rollback(skills_src, SKILLS_DIR)
+        stage_root = BACKUP_BASE_DIR / ".plugins-restore-staging"
+        if stage_root.exists():
+            _remove_path(stage_root)
+        stage_root.mkdir(parents=True)
+        staged_dirs: list[tuple[Path, Path]] = []
+        for name, destination in (("plugins", PLUGINS_DIR), ("skills", SKILLS_DIR)):
+            source = src / name
+            if source.exists():
+                staged = stage_root / name
+                _copytree(source, staged)
+                staged_dirs.append((staged, destination))
+        old_dirs: list[tuple[Path, Path]] = []
+        installed_dirs: list[Path] = []
+        try:
+            for index, (staged, destination) in enumerate(staged_dirs):
+                old = destination.with_name(f".{destination.name}.restore-old-{index}")
+                if old.exists() or old.is_symlink():
+                    _remove_path(old)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists() or destination.is_symlink():
+                    destination.rename(old)
+                    old_dirs.append((old, destination))
+                staged.rename(destination)
+                installed_dirs.append(destination)
+            for old, _destination in old_dirs:
+                _remove_path(old)
+        except (OSError, shutil.Error):
+            for destination in installed_dirs:
+                if destination.exists() or destination.is_symlink():
+                    _remove_path(destination)
+            for old, destination in reversed(old_dirs):
+                if old.exists() or old.is_symlink():
+                    old.rename(destination)
+            raise
+        finally:
+            if stage_root.exists():
+                _remove_path(stage_root)
 
         # Detect broken symlinks after restore
         broken = []
@@ -478,7 +713,7 @@ def restore_plugins_backup(backup_path: str) -> tuple[bool, list[str]]:
         broken.extend(detect_broken_symlinks(SKILLS_DIR))
 
         return True, broken
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, shutil.Error) as e:
         logger.warning("Failed to restore plugins backup: %s", e)
         return False, []
 
@@ -489,15 +724,44 @@ def restore_sessions_backup(backup_path: str) -> bool:
     projects_src = src / "projects"
     if not src.exists() or not projects_src.exists():
         return False
+    record = src / "codex_session_imports.json"
+    record_target = _app_data_dir() / record.name
+    record_stage = record_target.with_name(f".{record_target.name}.restoring")
+    record_old = record_target.with_name(f".{record_target.name}.restore-old")
+    safety = None
+    record_installed = False
     try:
-        _validate_backup_path(src)
-        # Safety: backup current sessions first
-        create_sessions_backup()
+        _validate_restore_source(src, "sessions")
+        safety = _require_safety_backup(create_sessions_backup, [PROJECTS_DIR])
+        if record.exists():
+            record_target.parent.mkdir(parents=True, exist_ok=True)
+            if record_stage.exists() or record_stage.is_symlink():
+                _remove_path(record_stage)
+            shutil.copy2(str(record), str(record_stage))
+            _restrict(record_stage)
 
         _replace_dir_with_rollback(projects_src, PROJECTS_DIR)
+        if record_stage.exists():
+            if record_target.exists() or record_target.is_symlink():
+                record_target.rename(record_old)
+            record_stage.replace(record_target)
+            record_installed = True
+        if record_old.exists():
+            _remove_path(record_old)
         return True
     except (OSError, ValueError, shutil.Error) as e:
         logger.warning("Failed to restore sessions backup: %s", e)
+        try:
+            if record_installed and (record_target.exists() or record_target.is_symlink()):
+                _remove_path(record_target)
+            if record_old.exists() or record_old.is_symlink():
+                record_old.rename(record_target)
+            if record_stage.exists() or record_stage.is_symlink():
+                _remove_path(record_stage)
+            if safety is not None and (safety_path := Path(safety) / "projects").exists():
+                _replace_dir_with_rollback(safety_path, PROJECTS_DIR)
+        except OSError as rollback_error:
+            logger.error("Sessions restore rollback failed: %s", rollback_error)
         return False
 
 
@@ -507,20 +771,63 @@ def restore_codex_backup(backup_path: str) -> bool:
     sessions_src = src / "sessions"
     if not src.exists() or not sessions_src.exists():
         return False
+    stage = CODEX_SESSIONS_DIR.with_name(".sessions.restoring")
+    old = CODEX_SESSIONS_DIR.with_name(".sessions.restore-old")
+    stage_meta: list[tuple[Path, Path]] = []
+    old_meta: list[tuple[Path, Path]] = []
+    installed_meta: list[Path] = []
+    moved_sessions = installed_sessions = False
     try:
-        _validate_backup_path(src)
-        # Safety: back up current Codex sessions first.
-        create_codex_backup()
-
-        # Rollback-safe: live dir is moved aside and restored if the copy fails.
-        _replace_dir_with_rollback(sessions_src, CODEX_SESSIONS_DIR)
-        for name in ("session_index.jsonl", "history.jsonl", "config.toml"):
-            f = src / name
-            if f.exists():
-                shutil.copy2(str(f), str(CODEX_DIR / name))
+        _validate_restore_source(src, "codex")
+        _require_safety_backup(create_codex_backup, [CODEX_SESSIONS_DIR])
+        for path in (stage, old):
+            if path.exists() or path.is_symlink():
+                _remove_path(path)
+        _copytree(sessions_src, stage)
+        for name in ("session_index.jsonl", "history.jsonl", "config.toml", "external_agent_session_imports.json"):
+            source = src / name
+            if source.exists():
+                staged = stage.with_name(f".{name}.restoring")
+                shutil.copy2(str(source), str(staged))
+                _restrict(staged)
+                stage_meta.append((staged, CODEX_DIR / name))
+        if CODEX_SESSIONS_DIR.exists() or CODEX_SESSIONS_DIR.is_symlink():
+            CODEX_SESSIONS_DIR.rename(old)
+            moved_sessions = True
+        stage.rename(CODEX_SESSIONS_DIR)
+        installed_sessions = True
+        for staged, destination in stage_meta:
+            old_path = destination.with_name(f".{destination.name}.restore-old")
+            if destination.exists() or destination.is_symlink():
+                destination.rename(old_path)
+                old_meta.append((old_path, destination))
+            staged.rename(destination)
+            installed_meta.append(destination)
+        if moved_sessions:
+            _remove_path(old)
+        for old_path, _destination in old_meta:
+            _remove_path(old_path)
         return True
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, shutil.Error) as e:
         logger.warning("Failed to restore codex backup: %s", e)
+        try:
+            if installed_sessions and (CODEX_SESSIONS_DIR.exists() or CODEX_SESSIONS_DIR.is_symlink()):
+                _remove_path(CODEX_SESSIONS_DIR)
+            if moved_sessions and (old.exists() or old.is_symlink()):
+                old.rename(CODEX_SESSIONS_DIR)
+            for destination in installed_meta:
+                if destination.exists() or destination.is_symlink():
+                    _remove_path(destination)
+            for old_path, destination in reversed(old_meta):
+                if old_path.exists() or old_path.is_symlink():
+                    old_path.rename(destination)
+            if stage.exists() or stage.is_symlink():
+                _remove_path(stage)
+            for staged, _destination in stage_meta:
+                if staged.exists() or staged.is_symlink():
+                    _remove_path(staged)
+        except OSError as rollback_error:
+            logger.error("Codex restore rollback failed: %s", rollback_error)
         return False
 
 
@@ -534,6 +841,9 @@ def delete_backup(backup_path: str) -> bool:
         return False
     try:
         _validate_backup_path(p)
+        from asm.services.cleaner import record_trash
+
+        record_trash(p, "backup")
         send2trash(str(p))
         return True
     except (OSError, ValueError) as e:
@@ -557,6 +867,7 @@ def export_backup(backup_path: str, dest_dir: str | None = None) -> str | None:
     src = Path(backup_path)
     if not src.exists():
         return None
+    archive_path = None
     try:
         _validate_backup_path(src)
         if dest_dir:
@@ -583,6 +894,11 @@ def export_backup(backup_path: str, dest_dir: str | None = None) -> str | None:
         return str(archive_path)
     except (OSError, ValueError, tarfile.TarError) as e:
         logger.warning("Failed to export backup: %s", e)
+        if archive_path is not None and archive_path.exists():
+            try:
+                archive_path.unlink()
+            except OSError:
+                logger.error("Failed to remove partial archive %s", archive_path)
         return None
 
 
@@ -594,27 +910,27 @@ def import_backup(archive_path: str) -> str | None:
     src = Path(archive_path)
     if not src.exists() or not src.name.endswith(".tar.gz"):
         return None
+    staging = None
     try:
         backup_dir = _ensure_backup_dir()
-
+        archive_size = src.stat().st_size
         with tarfile.open(str(src), "r:gz") as tar:
-            members = tar.getmembers()
-            for member in members:
-                if not _is_safe_tar_member(member):
-                    raise ValueError(f"Unsafe path in archive: {member.name}")
-            # Python 3.12+ supports filter param; older versions don't
-            try:
-                tar.extractall(path=str(backup_dir), members=members, filter="data")
-            except TypeError:
-                tar.extractall(path=str(backup_dir), members=members)
-
-        # Determine the extracted name (first component of archive contents)
+            members, top = _validated_archive_members(tar, archive_size)
+        final = backup_dir / top
+        if final.exists() or final.is_symlink():
+            raise FileExistsError(f"Backup already exists: {final}")
+        staging = Path(tempfile.mkdtemp(prefix=".backup-import-", dir=str(backup_dir)))
         with tarfile.open(str(src), "r:gz") as tar:
-            names = tar.getnames()
-            if names:
-                top = names[0].split("/")[0]
-                return str(backup_dir / top)
-        return None
+            members, checked_top = _validated_archive_members(tar, archive_size)
+            if checked_top != top:
+                raise ValueError("Archive changed while it was being read")
+            _extract_archive_safely(tar, members, staging)
+        (staging / top).rename(final)
+        staging.rmdir()
+        staging = None
+        return str(final)
     except (OSError, ValueError, tarfile.TarError) as e:
         logger.warning("Failed to import backup: %s", e)
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
         return None

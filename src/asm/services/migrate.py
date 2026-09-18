@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from send2trash import send2trash
 
 from asm.models import PROJECTS_DIR, decode_path_hint, encode_path
+from asm.utils import strict_child, validate_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +76,19 @@ def migrate_sessions(
         session_ids: If provided, only migrate these specific session IDs.
                      If None, migrate all sessions.
     """
+    if mode not in {"append", "overwrite"}:
+        return MigrateResult(success=False, message=f"Unknown migration mode: {mode}")
     source_encoded = source_encoded or encode_path(source_path)
     target_encoded = target_encoded or encode_path(target_path)
-    source_dir = PROJECTS_DIR / source_encoded
-    target_dir = PROJECTS_DIR / target_encoded
+    try:
+        validate_identifier(source_encoded, "source project directory")
+        validate_identifier(target_encoded, "target project directory")
+        source_dir = strict_child(PROJECTS_DIR / source_encoded, PROJECTS_DIR)
+        target_dir = strict_child(PROJECTS_DIR / target_encoded, PROJECTS_DIR)
+    except ValueError as exc:
+        return MigrateResult(success=False, message=str(exc))
+    if source_encoded == target_encoded or source_dir == target_dir:
+        return MigrateResult(success=False, message="Source and target are the same")
 
     # Validate source
     if not source_dir.exists():
@@ -88,6 +100,8 @@ def migrate_sessions(
 
     # Check for session files (filter by session_ids if provided)
     all_sessions = list(source_dir.glob("*.jsonl"))
+    if any(f.is_symlink() for f in all_sessions):
+        return MigrateResult(success=False, message="Source contains a session symlink")
     if session_ids is not None:
         id_set = set(session_ids)
         source_sessions = [f for f in all_sessions if f.stem in id_set]
@@ -96,75 +110,78 @@ def migrate_sessions(
     if not source_sessions:
         return MigrateResult(success=False, message="No session files to migrate")
 
-    # Prepare target
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    # Overwrite mode: clear existing
-    if mode == "overwrite":
-        for existing in target_dir.iterdir():
-            send2trash(str(existing))
-
-    # Copy sessions (tracking exactly which files landed in this run — only
-    # those may be path-rewritten below, or repeat runs corrupt earlier copies)
+    stage = Path(tempfile.mkdtemp(prefix=".asm-migrate-", dir=str(PROJECTS_DIR)))
     copied = 0
     skipped = 0
     copied_files: list[Path] = []
-    for src_file in source_sessions:
-        dest_file = target_dir / src_file.name
-        if mode == "append" and dest_file.exists():
-            skipped += 1
-            continue
-        shutil.copy2(str(src_file), str(dest_file))
-        copied += 1
-        copied_files.append(dest_file)
-
-    # Copy memory
     memory_copied = False
-    source_memory = source_dir / "memory"
-    if source_memory.exists():
-        target_memory = target_dir / "memory"
-        if mode == "overwrite" and target_memory.exists():
-            shutil.rmtree(str(target_memory))
-        if not target_memory.exists():
-            shutil.copytree(str(source_memory), str(target_memory))
-            memory_copied = True
-        else:
-            # Append: copy only new files
-            for f in source_memory.rglob("*"):
-                if f.is_file():
-                    rel = f.relative_to(source_memory)
-                    dest = target_memory / rel
-                    if not dest.exists():
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(f), str(dest))
-                        memory_copied = True
+    try:
+        if mode == "append" and target_dir.exists():
+            shutil.copytree(str(target_dir), str(stage), symlinks=True, dirs_exist_ok=True)
+        for src_file in source_sessions:
+            dest_file = stage / src_file.name
+            if mode == "append" and (target_dir / src_file.name).exists():
+                skipped += 1
+                continue
+            shutil.copy2(str(src_file), str(dest_file))
+            copied += 1
+            copied_files.append(dest_file)
 
-    # Copy sessions-index.json
-    src_index = source_dir / "sessions-index.json"
-    index_copied: Path | None = None
-    if src_index.exists():
-        dest_index = target_dir / "sessions-index.json"
-        if mode == "overwrite" or not dest_index.exists():
-            shutil.copy2(str(src_index), str(dest_index))
-            index_copied = dest_index
+        source_memory = source_dir / "memory"
+        if source_memory.exists():
+            target_memory = stage / "memory"
+            if mode == "overwrite" and target_memory.exists():
+                shutil.rmtree(str(target_memory))
+            if not target_memory.exists():
+                shutil.copytree(str(source_memory), str(target_memory), symlinks=True)
+                memory_copied = True
+            else:
+                for f in source_memory.rglob("*"):
+                    if f.is_symlink():
+                        raise OSError(f"Source memory contains a symlink: {f}")
+                    if f.is_file():
+                        rel = f.relative_to(source_memory)
+                        dest = target_memory / rel
+                        if not dest.exists():
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(str(f), str(dest))
+                            memory_copied = True
 
-    # Update paths in the files copied THIS run only — files from earlier runs
-    # already point at the target, and rewriting them again nests the path
-    # (source is often a prefix of target).
-    if source_path != target_path:
-        _update_paths(copied_files, index_copied, source_path, target_path,
-                      source_encoded, target_encoded)
+        _merge_index(
+            source_dir / "sessions-index.json",
+            stage / "sessions-index.json",
+            {f.stem for f in source_sessions},
+            mode,
+            source_path,
+            target_path,
+            source_encoded,
+            target_encoded,
+        )
+        if source_path != target_path:
+            _update_paths(copied_files, None, source_path, target_path, source_encoded, target_encoded)
+        if mode == "overwrite" and target_dir.exists():
+            from asm.services.recovery import create_recovery_snapshot
 
-    msg = f"{copied} sessions migrated"
-    if skipped:
-        msg += f", {skipped} already in target (skipped)"
-    return MigrateResult(
-        success=True,
-        sessions_copied=copied,
-        sessions_skipped=skipped,
-        memory_copied=memory_copied,
-        message=f"{msg} ({source_path} -> {target_path})",
-    )
+            if not create_recovery_snapshot(target_dir, "migration"):
+                raise OSError("Migration safety snapshot failed")
+        _commit_stage(stage, target_dir, mode)
+        stage = None
+        msg = f"{copied} sessions migrated"
+        if skipped:
+            msg += f", {skipped} already in target (skipped)"
+        return MigrateResult(
+            success=True,
+            sessions_copied=copied,
+            sessions_skipped=skipped,
+            memory_copied=memory_copied,
+            message=f"{msg} ({source_path} -> {target_path})",
+        )
+    except (OSError, ValueError, json.JSONDecodeError, shutil.Error) as exc:
+        logger.warning("Migration failed: %s", exc)
+        return MigrateResult(success=False, sessions_copied=copied, sessions_skipped=skipped, message=str(exc))
+    finally:
+        if stage is not None and stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 _PATH_FIELDS = {"cwd", "projectPath", "path", "directory", "projectDir", "workingDirectory"}
@@ -178,15 +195,101 @@ def _replace_in_obj(obj: object, old: str, new: str, restrict_keys: bool = True)
     """
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if isinstance(v, str) and old in v:
+            if isinstance(v, str) and _path_replacement(v, old, new) != v:
                 if not restrict_keys or k in _PATH_FIELDS:
-                    obj[k] = v.replace(old, new)
+                    obj[k] = _path_replacement(v, old, new)
             elif isinstance(v, (dict, list)):
                 _replace_in_obj(v, old, new, restrict_keys)
     elif isinstance(obj, list):
         for i, item in enumerate(obj):
             if isinstance(item, (dict, list)):
                 _replace_in_obj(item, old, new, restrict_keys)
+
+
+def _path_replacement(value: str, old: str, new: str) -> str:
+    if value == old:
+        return new
+    prefixes = (old + os.sep, old + "/", old + "\\")
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            return new + value[len(old):]
+    return value
+
+
+def _merge_index(
+    source: Path,
+    target: Path,
+    selected: set[str],
+    mode: str,
+    source_path: str,
+    target_path: str,
+    source_encoded: str,
+    target_encoded: str,
+) -> None:
+    if not source.exists() and not target.exists():
+        return
+    source_data = _read_index(source) if source.exists() else {"entries": []}
+    target_data = _read_index(target) if target.exists() else {"entries": []}
+    source_entries = [entry for entry in source_data["entries"] if entry.get("sessionId") in selected]
+    for entry in source_entries:
+        _replace_in_obj(entry, source_path, target_path, restrict_keys=False)
+        _replace_in_obj(entry, source_encoded, target_encoded, restrict_keys=False)
+    if mode == "overwrite":
+        entries = source_entries
+    else:
+        entries = target_data["entries"]
+        known = {entry.get("sessionId") for entry in entries}
+        entries.extend(entry for entry in source_entries if entry.get("sessionId") not in known)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({**target_data, "entries": entries}, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_index(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid sessions index: {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("entries", []), list):
+        raise ValueError(f"Invalid sessions index: {path}")
+    entries = data.get("entries", [])
+    if any(not isinstance(entry, dict) or not entry.get("sessionId") for entry in entries):
+        raise ValueError(f"Invalid sessions index entries: {path}")
+    data["entries"] = entries
+    return data
+
+
+def _commit_stage(stage: Path, target: Path, mode: str) -> None:
+    if mode == "append":
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(stage), str(target), symlinks=True, dirs_exist_ok=True)
+        shutil.rmtree(stage)
+        return
+    old = target.with_name(f".{target.name}.migration-old")
+    if old.exists() or old.is_symlink():
+        if old.is_dir() and not old.is_symlink():
+            shutil.rmtree(old)
+        else:
+            old.unlink()
+    moved = False
+    try:
+        if target.exists() or target.is_symlink():
+            target.rename(old)
+            moved = True
+        stage.rename(target)
+        if moved:
+            from asm.services.cleaner import record_trash
+
+            record_trash(old, "migration")
+            send2trash(str(old))
+    except OSError:
+        if target.exists() or target.is_symlink():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        if moved and (old.exists() or old.is_symlink()):
+            old.rename(target)
+        raise
 
 
 def _update_paths(
@@ -198,38 +301,29 @@ def _update_paths(
     target_encoded: str,
 ) -> None:
     """Update path references in the files copied by this run."""
-    # Update JSONL files - parse each line as JSON to avoid partial matches
     for jsonl in copied_files:
-        try:
-            lines = jsonl.read_text().splitlines()
-            updated = []
-            modified = False
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    before = json.dumps(obj, ensure_ascii=False)
-                    _replace_in_obj(obj, source_path, target_path, restrict_keys=True)
-                    after = json.dumps(obj, ensure_ascii=False)
-                    updated.append(after)
-                    if before != after:
-                        modified = True
-                except json.JSONDecodeError:
-                    updated.append(line)
-            if modified:
-                jsonl.write_text("\n".join(updated) + "\n")
-        except OSError as e:
-            logger.warning("Path rewrite failed for %s: %s", jsonl.name, e)
+        lines = jsonl.read_text(encoding="utf-8").splitlines()
+        updated = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise ValueError(f"Malformed migrated session: {jsonl}") from exc
+            if not isinstance(obj, dict):
+                raise ValueError(f"Unexpected migrated session record: {jsonl}")
+            _replace_in_obj(obj, source_path, target_path, restrict_keys=True)
+            updated.append(json.dumps(obj, ensure_ascii=False))
+        tmp = jsonl.with_suffix(".jsonl.rewrite")
+        tmp.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        os.replace(tmp, jsonl)
 
-    # sessions-index.json - parse as JSON, not string replace
     idx = copied_index
     if idx is not None and idx.exists():
-        try:
-            data = json.loads(idx.read_text())
-            _replace_in_obj(data, source_path, target_path, restrict_keys=False)
-            _replace_in_obj(data, source_encoded, target_encoded, restrict_keys=False)
-            idx.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("sessions-index.json rewrite failed for %s: %s", idx, e)
+        data = _read_index(idx)
+        _replace_in_obj(data, source_path, target_path, restrict_keys=False)
+        _replace_in_obj(data, source_encoded, target_encoded, restrict_keys=False)
+        tmp = idx.with_suffix(".json.rewrite")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, idx)

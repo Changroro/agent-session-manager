@@ -581,14 +581,14 @@ class DebugTodosPane(Container):
     def _do_prune_debug(self) -> None:
         def _work():
             ok, fail = prune_empty_debug_files()
-            self.app.call_from_thread(self.app.notify, t("dt.prune_ok", ok=ok))
+            self.app.call_from_thread(self.app.notify, t("dt.prune_ok", ok=ok, fail=fail))
             self.app.call_from_thread(self.refresh_data)
         self.run_worker(_work, thread=True)
 
     def _do_prune_todo(self) -> None:
         def _work():
             ok, fail = prune_empty_todo_files()
-            self.app.call_from_thread(self.app.notify, t("dt.prune_ok", ok=ok))
+            self.app.call_from_thread(self.app.notify, t("dt.prune_ok", ok=ok, fail=fail))
             self.app.call_from_thread(self.refresh_data)
         self.run_worker(_work, thread=True)
 

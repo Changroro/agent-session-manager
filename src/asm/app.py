@@ -104,12 +104,9 @@ class CCTuiApp(App):
         yield Footer()
 
     def action_tab(self, tab_id: str) -> None:
-        """Switch to a specific tab by ID (ignored if the tab isn't present)."""
+        """Switch to a specific tab by ID."""
         tabs = self.query_one("#main-tabs", TabbedContent)
-        try:
-            tabs.get_pane(tab_id)
-        except Exception:
-            return
+        tabs.get_pane(tab_id)
         tabs.active = tab_id
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
@@ -120,16 +117,10 @@ class CCTuiApp(App):
             self.call_after_refresh(self._focus_dashboard)
 
     def _focus_dashboard(self) -> None:
-        try:
-            self.query_one("DashboardPane").focus()
-        except Exception:
-            pass
+        self.query_one("DashboardPane").focus()
 
     def _dashboard_active(self) -> bool:
-        try:
-            return self.query_one("#main-tabs", TabbedContent).active == "tab-dashboard"
-        except Exception:
-            return False
+        return self.query_one("#main-tabs", TabbedContent).active == "tab-dashboard"
 
     def _dash(self, period: str | None) -> None:
         if self._dashboard_active():
@@ -141,10 +132,7 @@ class CCTuiApp(App):
 
     def action_dash_set_source(self, name: str) -> None:
         """Set a specific dashboard source filter (from a clicked chip)."""
-        try:
-            self.query_one("DashboardPane").set_source(name)
-        except Exception:
-            pass
+        self.query_one("DashboardPane").set_source(name)
 
     def action_dash_daily(self) -> None:
         self._dash("daily")

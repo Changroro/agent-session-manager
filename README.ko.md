@@ -70,7 +70,7 @@
 ### Claude ↔ Codex (`F8` 탭)
 - **MCP 서버 양방향:** `~/.codex/config.toml`과 `~/.claude.json`을 비교해 한쪽에만 있는 항목을 찾고, 각 에이전트의 `mcp add` CLI로 추가한다(파일 포맷·주석 보존). 인증 헤더와 env는 그대로 옮기며, `codex mcp add`가 HTTP 헤더를 표현하지 못해 그 부분만 `[mcp_servers.<name>.http_headers]`로 덧붙인다
 - **세션 양방향 복사:** Claude 대화록 ↔ Codex rollout 스레드 변환 — 실제 CLI에서 resume해 맥락이 복원되는 것까지 확인했다. Claude→Codex는 공식 importer와 같은 `content_sha256` 원장에 기록해 Codex가 이미 가져온 세션을 중복 생성하지 않고, `/import`와 달리 원하는 세션만 고를 수 있다(30일·50개 제한 없음)
-- 가져온 사본은 **토큰 사용량이 0**으로 기록돼, 옮긴 세션이 두 번 과금 집계되지 않는다
+- 가져온 사본은 **토큰 사용량이 0**으로 기록돼, 복사한 세션이 두 번 과금 집계되지 않는다
 - 쓰기 전에 항상 계획을 먼저 보여준다: 가져올 수 있음 / 건너뜀 / 미지원 목록을 미리 확인하고, 첫 쓰기 전에 백업 스냅샷을 만든다
 - **기본 선택은 없다.** 계획은 최신 200개까지만 잡고(2.5만 개 rollout을 전부 해시하면 느리다), 제외된 오래된 개수를 함께 표시해 잘린 목록이 "이게 전부"로 읽히지 않게 한다
 
@@ -148,7 +148,7 @@ asm --no-update-check     # 시작 시 업데이트 확인 건너뛰기
 
 ### Headless CLI
 
-모든 기능을 서브커맨드로도 쓸 수 있습니다 — 스크립트나 AI 에이전트에서 유용합니다. 터미널에서는 rich 테이블, 파이프로 받으면 plain text, `--json`이면 기계가 읽는 JSON으로 출력됩니다.
+데이터 작업은 스크립트나 AI 에이전트에서 쓸 수 있도록 headless 서브커맨드로 제공합니다. instruction 편집, Codex cwd 이동, Artifact 브라우저/클립보드 동작은 TUI에서 제공합니다. 터미널에서는 rich 테이블, 파이프로 받으면 plain text, `--json`이면 기계가 읽는 JSON으로 출력됩니다.
 
 ```bash
 # 조회 (읽기 전용)
@@ -158,7 +158,7 @@ asm sessions --search "방화벽"     # 세션 제목 검색
 asm preview <session-id>          # 대화 내용 출력
 asm resume <session-id>           # 세션의 프로젝트로 이동해 바로 resume (Claude/Codex)
 asm artifacts                     # Artifact 도구로 발행한 페이지 목록
-asm import list --to claude       # Codex -> Claude 로 옮길 수 있는 세션
+asm import list --to claude       # Codex -> Claude 로 복사할 수 있는 세션
 asm backup list / asm recovery list
 
 # 변경 — 실행 전 항상 확인을 묻습니다(--yes로 생략). TUI와 동일하게
@@ -168,8 +168,8 @@ asm trash <session-id>
 asm backup create --type full     # config|full|settings|plugins|sessions|codex
 asm backup restore <path> / asm recovery restore <id>
 asm migrate /old/project /new/project
-asm import session <session-id>   # 세션 1개 이동(방향은 id로 자동 판별)
-asm import mcp --to codex         # MCP 서버 이동
+asm import session <session-id>   # 세션 1개 복사(방향은 id로 자동 판별)
+asm import mcp --to codex         # MCP 서버 복사
 ```
 
 Codex App·CLI·동반 에이전트는 세션 저장소 하나를 공유한다 —

@@ -266,11 +266,10 @@ def test_live_import_into_claude_config_dir(tmp_path, monkeypatch):
 
 
 def test_live_import_leaves_real_user_data_untouched():
-    real_claude = Path.home() / ".claude.json"
-    real_codex = Path.home() / ".codex" / "config.toml"
+    from asm import models
 
-    assert agent_import.CLAUDE_JSON == real_claude
-    assert agent_import.CODEX_CONFIG == real_codex
+    assert agent_import.CLAUDE_JSON == models.CLAUDE_JSON
+    assert agent_import.CODEX_CONFIG == models.CODEX_DIR / "config.toml"
     assert agent_import.SUBPROCESS_ENV == {}
 
 
@@ -464,6 +463,7 @@ def test_asm_codex_parser_reads_the_written_rollout(claude_session, monkeypatch)
     from asm.services import backup, codex_data
 
     monkeypatch.setattr(backup, "create_codex_backup", lambda: None)
+    monkeypatch.setattr(agent_import, "codex_cli_version", lambda: "0.145.0")
     agent_import.apply_sessions_to_codex(agent_import.plan_sessions_to_codex())
     monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", agent_import.CODEX_SESSIONS_DIR)
     codex_data.refresh()
@@ -752,8 +752,7 @@ def test_title_falls_back_when_every_user_turn_is_a_preamble(claude_session, tmp
 
     plan = agent_import.plan_sessions_to_codex([only_preamble])
 
-    # Claude drops `<`-prefixed user turns, so only the assistant turn survives.
-    assert plan.new[0].title == "답변"
+    assert plan.new[0].title == "<wrapper>only this</wrapper>"
 
 
 # --- Single active Codex home ---
