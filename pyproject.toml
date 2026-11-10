@@ -1,6 +1,6 @@
 [project]
 name = "agent-session-manager"
-version = "0.16.0"
+version = "0.16.1"
 description = "Manage Claude Code & Codex sessions, cost, and data from your terminal"
 readme = "README.md"
 license = {text = "MIT"}
