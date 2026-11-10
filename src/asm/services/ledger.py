@@ -19,6 +19,7 @@ import json
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS claude_titles(
 """
 
 _PROGRESS_EVERY = 200
+_ROLLOUT_ID = re.compile(r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$")
 
 
 def _db_path() -> Path:
@@ -285,6 +287,11 @@ def _update_codex(progress: ProgressCB | None) -> int:
     conn = _connect()
     try:
         known = _known_files(conn, "codex")
+        # Rows scanned before subagent rollouts were read correctly carry the
+        # parent's id; the file name always holds the thread's own id.
+        for path, sid in conn.execute("SELECT path, session_id FROM codex_sessions"):
+            if sid and _ROLLOUT_ID.search(path) and not path.endswith(f"-{sid}.jsonl"):
+                known.pop(path, None)
         todo: list[tuple[Path, tuple[float, int]]] = []
         for f in codex_data._rollout_files():
             stamp = _changed(known, f)

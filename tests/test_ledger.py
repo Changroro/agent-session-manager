@@ -110,3 +110,28 @@ def test_non_anthropic_model_is_kept_without_crashing(monkeypatch, tmp_path: Pat
     assert ledger.update_claude() == 1
     rec = ledger.claude_records()["m1"]
     assert rec["model"] == "zai-glm-5-3-flash" and rec["cost"] == 0.0
+
+
+def test_subagent_rollout_keeps_its_own_id_and_stale_rows_are_rescanned(monkeypatch, tmp_path: Path):
+    own, parent = "01a1c406-7ea7-7e40-a967-38aeff61cff3", "01a1c405-ccb9-76c1-a48e-5d8c685b8a8c"
+    sessions = tmp_path / "sessions"
+    f = sessions / "2026" / "11" / "10" / f"rollout-2026-11-10T14-55-22-{own}.jsonl"
+    f.parent.mkdir(parents=True)
+    f.write_text("\n".join(json.dumps(r) for r in [
+        {"type": "session_meta", "payload": {"id": own, "cwd": "/w", "source": "subagent"}},
+        {"type": "session_meta", "payload": {"id": parent, "cwd": "/w"}},  # parent's meta, copied in
+    ]) + "\n")
+    monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", sessions)
+    codex_data.refresh()
+    assert ledger.update_codex() == 1
+    assert [r["id"] for r in codex_data._scanned_sessions()] == [own]
+
+    # A row stored by the old scanner (parent's id) is re-read once, then left alone.
+    conn = ledger._connect()
+    with conn:
+        conn.execute("UPDATE codex_sessions SET session_id = ?", (parent,))
+    conn.close()
+    assert ledger.update_codex() == 1
+    assert ledger.update_codex() == 0
+    codex_data.refresh()
+    assert [r["id"] for r in codex_data._scanned_sessions()] == [own]

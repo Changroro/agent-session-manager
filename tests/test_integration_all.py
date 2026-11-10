@@ -294,6 +294,71 @@ class TestCodexFeatures:
         assert rows[old_id] == (str(orig), "/work/proj-a", "t", 570)
         assert rows[new_id] == (str(copy), "/work/proj-c", "t", 0)
 
+    def _state_db_with_thread(self, env, rollout: Path, sid: str):
+        import sqlite3
+
+        db = env["codex_dir"] / "state_5.sqlite"
+        with sqlite3.connect(db) as conn:
+            conn.executescript("""
+                CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT);
+                CREATE TABLE thread_read_receipts (thread_id TEXT, seen INTEGER);
+                CREATE TABLE thread_attachments (thread_id TEXT REFERENCES threads(id) ON DELETE CASCADE, blob BLOB);
+                CREATE TABLE rollout_migration_state (migration_id TEXT, last_checked_thread_id TEXT);
+            """)
+            conn.execute("INSERT INTO threads VALUES (?, ?, '/work/proj-a', 't')", (sid, str(rollout)))
+            conn.execute("INSERT INTO threads VALUES ('other', 'x', '/w', 'o')")
+            conn.execute("INSERT INTO thread_read_receipts VALUES (?, 1)", (sid,))
+            conn.execute("INSERT INTO thread_attachments VALUES (?, ?)", (sid, b"\x00\x01"))
+            conn.execute("INSERT INTO rollout_migration_state VALUES ('m', ?)", (sid,))
+        return db
+
+    def _db_rows(self, db):
+        import sqlite3
+
+        with sqlite3.connect(db) as conn:
+            return {
+                t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall())
+                for t in ("threads", "thread_read_receipts", "thread_attachments", "rollout_migration_state")
+            }
+
+    def test_trash_codex_session_removes_thread_rows_and_restore_brings_them_back(self, monkeypatch, tmp_path):
+        env = _setup_fake_codex(monkeypatch, tmp_path)
+        sid = "019ddddd-da44-7a72-8b78-912063531fae"
+        rollout = env["sessions_dir"] / "2026" / "06" / "01" / f"rollout-2026-06-01T09-00-00-{sid}.jsonl"
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": "/work/proj-a"}}) + "\n")
+        db = self._state_db_with_thread(env, rollout, sid)
+        before = self._db_rows(db)
+
+        assert cleaner.trash_codex_session(str(rollout)) is True
+
+        after = self._db_rows(db)
+        assert after["threads"] == [("other", "x", "/w", "o")]
+        assert after["thread_read_receipts"] == [] and after["thread_attachments"] == []
+        assert after["rollout_migration_state"] == before["rollout_migration_state"]  # Codex's bookmark kept
+        item = next(i for i in recovery.list_recovery_items() if i.category == "codex-session")
+        ok, msg = recovery.restore_recovery_item(item.id)
+        assert ok and "not restored" not in msg
+        assert rollout.exists() and self._db_rows(db) == before
+
+    def test_trash_codex_session_keeps_file_when_db_is_locked(self, monkeypatch, tmp_path):
+        import sqlite3
+
+        env = _setup_fake_codex(monkeypatch, tmp_path)
+        sid = "019ddddd-da44-7a72-8b78-912063531fae"
+        rollout = env["sessions_dir"] / "2026" / "06" / "01" / f"rollout-2026-06-01T09-00-00-{sid}.jsonl"
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": "/work/proj-a"}}) + "\n")
+        db = self._state_db_with_thread(env, rollout, sid)
+        locker = sqlite3.connect(db, isolation_level=None)
+        locker.execute("BEGIN EXCLUSIVE")
+        monkeypatch.setattr(sqlite3, "connect", lambda path, **kw: sqlite3.Connection(path, timeout=0.1, isolation_level=None))
+        try:
+            assert cleaner.trash_codex_session(str(rollout)) is False
+        finally:
+            locker.execute("ROLLBACK")
+            locker.close()
+        assert rollout.exists()
+        assert sid in {r[0] for r in self._db_rows(db)["threads"]}  # rolled back, nothing lost
+
     def test_codex_backup_restore_roundtrip(self, monkeypatch, tmp_path):
         env = _setup_fake_codex(monkeypatch, tmp_path)
         path = backup_service.create_codex_backup()

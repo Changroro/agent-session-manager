@@ -62,7 +62,7 @@ same view filtered to **Claude** and to **Codex**:
 - **Orphan cleanup:** detect and bulk-clean Claude sessions, file-history, debug, and task entries with no matching project
 - **Duplicate sessions:** find the same session copied across projects and delete individual copies
 - **Empty sessions:** clean stub sessions that hold only a title/metadata and no conversation (can't be resumed)
-- **Move / Copy:** move sessions to another project (same id; originals to trash with a recovery snapshot) or copy them under new ids (originals stay). Subagent/tool-result folders included, paths auto-rewritten
+- **Move / Copy:** move sessions to another project (same id; originals to trash with a recovery snapshot) or copy them under new ids (originals stay). Subagent/tool-result folders included, paths auto-rewritten. `relocate` moves the project folder itself too and lists files that still mention the old path. Sessions a running Claude Code / Codex is still using are refused
 
 ### Artifacts
 - Browse every page you've published with Claude Code's **Artifact tool** — scanned straight out of your session history, newest first
@@ -171,6 +171,7 @@ asm backup restore <path> / asm recovery restore <id>
 asm move /old/project /new/project                # move all its sessions (Claude + Codex); originals to trash
 asm move /old/project /new/project --sessions 3f2a1b9c   # only these (ids or unique prefixes)
 asm copy /old/project /new/project --sessions 3f2a1b9c   # duplicate under new session ids; originals stay
+asm relocate /old/project /new/project --dry-run          # move the folder itself + sessions + ~/.claude.json / Codex config keys
 asm import session <session-id>   # Copy one session; direction inferred from the id
 asm import mcp --to codex         # Copy MCP servers between agents
 ```

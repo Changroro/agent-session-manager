@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -136,6 +137,9 @@ def trash_single_session_file(project_encoded: str, session_id: str) -> bool:
         sidecar = project_root / session_id
         if sidecar.is_dir() and not sidecar.is_symlink():
             paths.append(_validate_path(sidecar, project_root))
+        from asm.services.live import ensure_claude_not_live
+
+        ensure_claude_not_live([session_id], paths[:1])
         for path in paths:
             _snapshot_or_raise(path, "session")
         for path in paths:
@@ -383,10 +387,25 @@ def trash_codex_session(path: str | Path) -> bool:
 
         if resolved == codex_data.CODEX_SESSIONS_DIR.resolve() or not resolved.is_relative_to(codex_data.CODEX_SESSIONS_DIR.resolve()):
             raise ValueError(f"Path outside Codex dir: {p}")
-        _snapshot_or_raise(resolved, "codex-session")
-        _log_trash(resolved, "codex-session")
-        send2trash(str(resolved))
+        from asm.services.live import ensure_codex_not_live
+        from asm.services.recovery import _recovery_root
+
+        session_id = resolved.name[-42:-6]  # rollout-<timestamp>-<36-char id>.jsonl
+        ensure_codex_not_live([session_id], [resolved])
+        snapshot_id = _snapshot_or_raise(resolved, "codex-session")
+        # Drop the thread from Codex's index too (else `codex resume` lists a dead
+        # entry); the rows ride along in the snapshot so a restore re-adds them.
+        conns, saved = codex_data.begin_thread_removal(session_id, resolved)
+        try:
+            if saved:
+                (_recovery_root(snapshot_id) / codex_data.THREAD_ROWS_FILE).write_text(json.dumps(saved))
+            _log_trash(resolved, "codex-session")
+            send2trash(str(resolved))
+        except BaseException:
+            codex_data.end_thread_removal(conns, commit=False)
+            raise
+        codex_data.end_thread_removal(conns, commit=True)
         return True
-    except (ValueError, PermissionError, OSError) as e:
+    except (ValueError, PermissionError, OSError, sqlite3.Error) as e:
         logger.warning("Failed to trash codex session %s: %s", path, e)
         return False

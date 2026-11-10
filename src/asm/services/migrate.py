@@ -115,6 +115,13 @@ def migrate_sessions(
         return MigrateResult(success=False, message="No session files to migrate")
     if any(f.is_symlink() or (source_dir / f.stem).is_symlink() for f in source_sessions):
         return MigrateResult(success=False, message="Source contains a session symlink")
+    if not copy:  # a copy never touches the originals
+        from asm.services.live import LiveSessionError, ensure_claude_not_live
+
+        try:
+            ensure_claude_not_live([f.stem for f in source_sessions], source_sessions)
+        except LiveSessionError as exc:
+            return MigrateResult(success=False, message=str(exc))
 
     stage = Path(tempfile.mkdtemp(prefix=".asm-migrate-", dir=str(PROJECTS_DIR)))
     staged: list[str] = []  # source ids staged for the target

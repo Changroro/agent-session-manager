@@ -773,8 +773,11 @@ def cmd_trash(args) -> int:
     from asm.services import cleaner, codex_data
 
     args.session_id = _resolve_session_id(args.session_id)
+    from asm.services.live import ensure_claude_not_live, ensure_codex_not_live
+
     encoded_dir = _find_claude_project_dir(args.session_id, args.project)
     if encoded_dir:
+        ensure_claude_not_live([args.session_id])
         if not _confirm(f"Trash Claude session {args.session_id} ({encoded_dir})?", args.yes):
             _result(args, {"error": "cancelled"}, "cancelled", error=True)
             return 1
@@ -787,6 +790,7 @@ def cmd_trash(args) -> int:
         # must stay trashable by id.
         s = codex_data.find_session(args.session_id)
         if s:
+            ensure_codex_not_live([args.session_id], [Path(s.project_dir)])
             if not _confirm(f"Trash Codex session {args.session_id}?", args.yes):
                 _result(args, {"error": "cancelled"}, "cancelled", error=True)
                 return 1
@@ -801,6 +805,53 @@ def cmd_trash(args) -> int:
 def cmd_move(args) -> int:
     """Move a project's Claude and Codex sessions (all, or --sessions) to another path."""
     return _move_or_copy(args, copy=False)
+
+
+def cmd_relocate(args) -> int:
+    """Move a whole project folder and re-point its Claude/Codex sessions and config."""
+    from asm.services import relocate
+
+    p = relocate.plan(args.src, args.dest)
+    n_claude = sum(len(ids) for _o, _n, ids in p.claude_projects)
+    summary = {
+        "from": p.old, "to": p.new,
+        "claude_sessions": n_claude, "claude_projects": [o for o, _n, _i in p.claude_projects],
+        "codex_sessions": len(p.codex_sessions),
+        "claude_config_keys": p.claude_config_keys, "codex_config_keys": p.codex_config_keys,
+        "git": p.git,
+    }
+    lines = [
+        f"  folder         {p.old}\n              -> {p.new}",
+        f"  Claude         {n_claude} session(s) in {len(p.claude_projects)} project dir(s)",
+        f"  Codex          {len(p.codex_sessions)} session(s)",
+        f"  ~/.claude.json {len(p.claude_config_keys)} project key(s)",
+        f"  Codex config   {len(p.codex_config_keys)} project key(s)",
+    ] + (["  git            worktree repair"] if p.git else [])
+    if args.dry_run:
+        _result(args, {**summary, "dry_run": True}, "Plan (dry run):\n" + "\n".join(lines))
+        return 0
+    if not _confirm("Relocate project?\n" + "\n".join(lines) + "\n(originals of moved sessions go to trash with a recovery snapshot)?", args.yes):
+        _result(args, {"error": "cancelled"}, "cancelled", error=True)
+        return 1
+
+    r = relocate.apply(p)
+    out = [f"moved folder; Claude {r.claude_moved}/{n_claude}, Codex {r.codex_moved}/{len(p.codex_sessions)} session(s)"]
+    out += [f"  FAILED {f}" for f in r.failures]
+    if r.failures:
+        out.append(f"  retry sessions with: asm move {p.old} {p.new}")
+    if r.git_repair:
+        out.append(f"  git worktree repair: {r.git_repair}")
+    if r.venv:
+        out.append("  .venv has the old path baked in: recreate it (e.g. `uv sync`)")
+    if r.references:
+        out.append(f"  {len(r.references)} file(s) still mention the old path (not changed):")
+        out += [f"    {f}" for f in r.references]
+    payload = {
+        **summary, "success": not r.failures, "claude_moved": r.claude_moved, "codex_moved": r.codex_moved,
+        "failures": r.failures, "git_repair": r.git_repair, "venv": r.venv, "references": r.references,
+    }
+    _result(args, payload, "\n".join(out), error=bool(r.failures))
+    return 1 if r.failures else 0
 
 
 def cmd_copy(args) -> int:
@@ -842,6 +893,11 @@ def _move_or_copy(args, copy: bool) -> int:
         _result(args, {"error": f"no sessions in {src}"}, f"no sessions in {src}", error=True)
         return 1
 
+    if not copy:  # refuse before touching anything, so a move is never half done
+        from asm.services.live import ensure_claude_not_live, ensure_codex_not_live
+
+        ensure_claude_not_live(claude_sel, [claude_dir / f"{sid}.jsonl" for sid in claude_sel])
+        ensure_codex_not_live(codex_sel, [Path(codex_all[sid]) for sid in codex_sel])
     verb = "Copy" if copy else "Move"
     note = "(copies get new session ids; originals stay)" if copy else "(originals go to trash with a recovery snapshot)"
     if not _confirm(
@@ -1166,6 +1222,17 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     p.add_argument("--yes", action="store_true", help="skip confirmation")
     _common(p)
     p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser(
+        "relocate",
+        help="move a whole project folder plus its Claude/Codex sessions and config (no AI; leftovers are listed)",
+    )
+    p.add_argument("src", help="current project folder")
+    p.add_argument("dest", help="new project folder (must not exist; same filesystem)")
+    p.add_argument("--dry-run", action="store_true", help="show what would change, change nothing")
+    p.add_argument("--yes", action="store_true", help="skip confirmation")
+    _common(p)
+    p.set_defaults(func=cmd_relocate)
 
     p = sub.add_parser("copy", help="copy sessions to another project path under new session ids (originals stay)")
     p.add_argument("src", help="project path the sessions belong to")

@@ -263,6 +263,14 @@ def restore_recovery_item(item_id: str, overwrite: bool = False) -> tuple[bool, 
                 else:
                     stage.unlink()
             raise
+        rows_file = item_root / "codex_threads.json"
+        if rows_file.exists():
+            from asm.services import codex_data
+
+            try:
+                codex_data.restore_thread_rows(json.loads(rows_file.read_text()))
+            except Exception as exc:  # the file is back; say what is missing instead of failing
+                return True, f"{original} (Codex index rows not restored: {exc})"
         return True, str(original)
     except (OSError, ValueError, KeyError, json.JSONDecodeError, shutil.Error) as exc:
         logger.warning("Failed to restore recovery item %s: %s", item_id, exc)

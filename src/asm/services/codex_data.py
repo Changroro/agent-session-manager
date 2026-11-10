@@ -124,8 +124,11 @@ def _scan_session(f: Path) -> dict | None:
                 if typ == "session_meta":
                     if not isinstance(payload.get("cwd", ""), str):
                         raise CodexDataError(f"unexpected session cwd: {f}")
-                    meta = payload
-                    model = payload.get("model", "") or model
+                    # Subagent/forked rollouts repeat the parent's session_meta
+                    # after their own; the first one is this thread.
+                    if meta is None:
+                        meta = payload
+                        model = payload.get("model", "") or model
                 elif typ == "turn_context":
                     if not isinstance(payload.get("model", ""), str):
                         raise CodexDataError(f"unexpected turn model: {f}")
@@ -511,6 +514,10 @@ def _relocate(rollout_path: str, new_cwd: str, copy: bool) -> str | None:
         old_id = (meta.get("id") or "") if isinstance(meta, dict) else ""
         if not old_cwd or (copy and not old_id):
             raise CodexDataError(f"rollout has no session_meta cwd/id: {p}")
+        if not copy:  # a copy never touches the original
+            from asm.services.live import ensure_codex_not_live
+
+            ensure_codex_not_live([old_id], [p])
         changed = False
         for obj in records:
             changed = _retarget_cwd(obj, old_cwd, new_cwd) or changed
@@ -566,15 +573,130 @@ def _relocate(rollout_path: str, new_cwd: str, copy: bool) -> str | None:
         refresh()
         return new_id
     except (OSError, CodexDataError, sqlite3.Error) as exc:
+        from asm.services.live import LiveSessionError
+
         logger.warning("Codex session %s failed for %s: %s", "copy" if copy else "move", rollout_path, exc)
         for conn in conns:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
         if created and target.exists():
             target.unlink()
+        if isinstance(exc, LiveSessionError):
+            raise  # the caller must tell the user why, not just "failed"
         return None
     finally:
         for conn in conns:
+            conn.close()
+
+
+# Columns that point at a thread; rollout_migration_state.last_checked_thread_id
+# is Codex's own scan bookmark and is deliberately not included.
+_THREAD_REF_COLUMNS = {"thread_id", "parent_thread_id", "child_thread_id"}
+THREAD_ROWS_FILE = "codex_threads.json"
+
+
+def _thread_refs(conn) -> list[tuple[str, str]]:
+    """``(table, column)`` pairs referencing a thread id, ``threads`` first."""
+    refs = []
+    for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+        for col in (r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')):
+            if (table == "threads" and col == "id") or col in _THREAD_REF_COLUMNS:
+                refs.append((table, col))
+    refs.sort(key=lambda r: r[0] != "threads")
+    return refs
+
+
+def _jsonable(value):
+    import base64
+
+    return {"b64": base64.b64encode(value).decode()} if isinstance(value, bytes) else value
+
+
+def _from_jsonable(value):
+    import base64
+
+    return base64.b64decode(value["b64"]) if isinstance(value, dict) and set(value) == {"b64"} else value
+
+
+def begin_thread_removal(session_id: str, rollout_path: Path):
+    """Delete a session's rows from every Codex state DB inside open transactions.
+
+    Returns ``(connections, saved_rows)``; nothing is final until
+    :func:`end_thread_removal` commits, so the caller can roll back if trashing
+    the rollout file fails. ``saved_rows`` is JSON-ready for :func:`restore_thread_rows`.
+    """
+    import sqlite3
+
+    conns: list = []
+    saved: dict[str, dict[str, list[dict]]] = {}
+    try:
+        for db in _state_dbs():
+            conn = sqlite3.connect(db, timeout=5, isolation_level=None)
+            conns.append(conn)
+            refs = _thread_refs(conn)
+            if not any(table == "threads" for table, _col in refs):
+                continue
+            conn.execute("BEGIN IMMEDIATE")
+            ids = {session_id} | {
+                r[0] for r in conn.execute("SELECT id FROM threads WHERE rollout_path = ?", (str(rollout_path),))
+            }
+            marks = ",".join("?" * len(ids))
+            rows: dict[str, list[dict]] = {}
+            for table, col in refs:
+                cur = conn.execute(f'SELECT * FROM "{table}" WHERE "{col}" IN ({marks})', tuple(ids))
+                names = [d[0] for d in cur.description]
+                rows.setdefault(table, []).extend(
+                    {n: _jsonable(v) for n, v in zip(names, row)} for row in cur.fetchall()
+                )
+            for table, col in reversed(refs):  # children before the thread itself
+                conn.execute(f'DELETE FROM "{table}" WHERE "{col}" IN ({marks})', tuple(ids))
+            rows = {t: r for t, r in rows.items() if r}
+            if rows:
+                saved[db.name] = rows
+    except Exception:
+        end_thread_removal(conns, commit=False)
+        raise
+    return conns, saved
+
+
+def end_thread_removal(conns, commit: bool) -> None:
+    try:
+        for conn in conns:
+            if conn.in_transaction:
+                conn.execute("COMMIT" if commit else "ROLLBACK")
+    finally:
+        for conn in conns:
+            conn.close()
+
+
+def restore_thread_rows(saved: dict) -> None:
+    """Re-insert rows saved by :func:`begin_thread_removal` (existing rows are kept)."""
+    import sqlite3
+
+    for db_name, tables in saved.items():
+        if "/" in db_name or not (db_name.startswith("state_") and db_name.endswith(".sqlite")):
+            raise CodexDataError(f"unexpected Codex state DB name: {db_name}")
+        db = CODEX_SESSIONS_DIR.parent / db_name
+        if not db.exists():
+            raise CodexDataError(f"Codex state DB {db_name} no longer exists; Codex will re-index the rollout")
+        conn = sqlite3.connect(db, timeout=5, isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for table in sorted(tables, key=lambda t: t != "threads"):
+                cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+                for row in tables[table]:
+                    keys = [k for k in row if k in cols]
+                    conn.execute(
+                        f'INSERT OR IGNORE INTO "{table}" ({", ".join(f"{chr(34)}{k}{chr(34)}" for k in keys)}) '
+                        f'VALUES ({", ".join("?" * len(keys))})',
+                        [_from_jsonable(row[k]) for k in keys],
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
             conn.close()
 
 

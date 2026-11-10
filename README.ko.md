@@ -61,7 +61,7 @@
 - **고아 정리:** 매칭 프로젝트 없는 Claude 세션·파일히스토리·디버그·task 일괄 정리
 - **중복 세션:** 여러 프로젝트에 복사된 동일 세션을 찾아 개별 복사본 삭제
 - **빈 세션:** 제목/메타만 있고 대화가 없는(resume 불가) stub 세션 정리
-- **이동 / 복사:** 세션을 다른 프로젝트로 이동(id 유지, 원본은 복구 스냅샷과 함께 휴지통) 또는 새 id로 복사(원본 유지). 서브에이전트·도구 결과 폴더 포함, 경로 자동 갱신
+- **이동 / 복사:** 세션을 다른 프로젝트로 이동(id 유지, 원본은 복구 스냅샷과 함께 휴지통) 또는 새 id로 복사(원본 유지). 서브에이전트·도구 결과 폴더 포함, 경로 자동 갱신. `relocate`는 프로젝트 폴더 자체도 옮기고, 옛 경로가 남은 파일은 목록으로 알려 줌. 실행 중인 Claude Code·Codex가 쓰고 있는 세션은 거부
 
 ### 아티팩트
 - Claude Code **Artifact 도구**로 발행한 페이지를 세션 기록에서 찾아 최신순으로 나열
@@ -170,6 +170,7 @@ asm backup restore <path> / asm recovery restore <id>
 asm move /old/project /new/project                # 그 프로젝트 세션 전부 이동(Claude+Codex), 원본은 휴지통
 asm move /old/project /new/project --sessions 3f2a1b9c   # 지정한 세션만 (id 앞자리 가능)
 asm copy /old/project /new/project --sessions 3f2a1b9c   # 새 세션 id로 복제, 원본 유지
+asm relocate /old/project /new/project --dry-run          # 프로젝트 폴더째 이동 + 세션 + ~/.claude.json·Codex 설정 키
 asm import session <session-id>   # 세션 1개 복사(방향은 id로 자동 판별)
 asm import mcp --to codex         # MCP 서버 복사
 ```

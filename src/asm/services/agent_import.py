@@ -810,7 +810,7 @@ def read_codex_rollout(path: Path) -> tuple[list[Turn], str, str]:
                     continue
                 kind = obj.get("type")
                 if kind == "session_meta":
-                    cwd = payload.get("cwd") or cwd
+                    cwd = cwd or payload.get("cwd")  # first meta is this thread; later ones are a parent's
                     continue
                 if kind == "turn_context":
                     model = payload.get("model") or model

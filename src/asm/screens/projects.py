@@ -1005,7 +1005,12 @@ class ProjectsPane(Container):
 
         def _work():
             from asm.services import codex_data
-            ok = codex_data.move_session(rollout_path, new_cwd)
+            from asm.services.live import LiveSessionError
+            try:
+                ok = codex_data.move_session(rollout_path, new_cwd)
+            except LiveSessionError as exc:
+                self.app.call_from_thread(self.app.notify, str(exc), severity="error")
+                return
             self.app.call_from_thread(self._on_codex_moved, ok)
         self.run_worker(_work, thread=True)
 
