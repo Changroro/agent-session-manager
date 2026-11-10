@@ -44,7 +44,8 @@ def list_artifacts() -> list[ArtifactInfo]:
     if not PROJECTS_DIR.exists():
         return []
     by_url: dict[str, ArtifactInfo] = {}
-    for f in _grep_files('"name":"Artifact"', PROJECTS_DIR, "*.jsonl"):
+    # Tool-use blocks only; tool *definitions* ("name":"Artifact","description") are in nearly every session.
+    for f in _grep_files('"name":"Artifact","input"', PROJECTS_DIR, "*.jsonl"):
         for info in _parse_session_file(f):
             prev = by_url.get(info.url)
             if prev is None or info.published >= prev.published:
@@ -61,9 +62,11 @@ def _parse_session_file(path: Path) -> list[ArtifactInfo]:
     pending: dict[str, tuple[dict, float]] = {}
     found: list[ArtifactInfo] = []
     try:
-        with open(path) as fh:
+        with open(path, "rb") as fh:
             for line in fh:
-                if "Artifact" not in line and "tool_use_id" not in line:
+                # Only decode/parse Artifact calls and the results of calls still
+                # pending; every other line is skipped as raw bytes.
+                if b"Artifact" not in line and not (pending and any(tid.encode() in line for tid in pending)):
                     continue
                 try:
                     obj = json.loads(line)
@@ -71,6 +74,9 @@ def _parse_session_file(path: Path) -> list[ArtifactInfo]:
                     raise ArtifactError(f"malformed artifact transcript: {path}") from exc
                 if not isinstance(obj, dict):
                     raise ArtifactError(f"unexpected artifact transcript shape: {path}")
+                # Other record types (e.g. api-request-blob) replay earlier turns verbatim.
+                if obj.get("type") not in ("user", "assistant"):
+                    continue
                 message = obj.get("message")
                 if message is None:
                     continue

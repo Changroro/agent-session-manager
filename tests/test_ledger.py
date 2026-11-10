@@ -88,3 +88,25 @@ def test_codex_ledger_full_history_and_missing_files(monkeypatch, tmp_path: Path
     # …but no longer listed as a browsable session.
     assert codex_data.get_project_sessions("/w/a") == []
     assert len(codex_data.get_project_sessions("/w/b")) == 1
+
+
+def test_unchanged_files_are_not_rehashed(monkeypatch, tmp_path: Path):
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_data, "PROJECTS_DIR", projects)
+    _write_claude_session(projects / "-p" / "s1.jsonl", "m1", "claude-fable-5", 10, "2026-07-01T10:00:00Z")
+    ledger.update_claude()
+    hashed = []
+    real = ledger._fingerprint
+    monkeypatch.setattr(ledger, "_fingerprint", lambda p: hashed.append(p) or real(p))
+    assert ledger.update_claude() == 0
+    assert hashed == []  # a refresh must not re-read every transcript
+
+
+def test_non_anthropic_model_is_kept_without_crashing(monkeypatch, tmp_path: Path):
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_data, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(pricing, "_live_db", {})
+    _write_claude_session(projects / "-p" / "s1.jsonl", "m1", "zai-glm-5-3-flash", 100, "2026-07-01T10:00:00Z")
+    assert ledger.update_claude() == 1
+    rec = ledger.claude_records()["m1"]
+    assert rec["model"] == "zai-glm-5-3-flash" and rec["cost"] == 0.0

@@ -255,3 +255,17 @@ def test_tab_is_wired_into_the_app(monkeypatch, tmp_path: Path):
         assert app.query_one("AgentImportPane") is not None
 
     _run_app(body)
+
+
+def test_stale_plan_from_previous_direction_is_ignored(monkeypatch, tmp_path: Path):
+    _isolate(monkeypatch, tmp_path)
+
+    async def body(app, pilot, pane):
+        pane.action_pick(1)
+        await asyncio.sleep(0.5)
+        await pilot.pause()
+        rows = list(pane._rows)
+        pane._on_loaded(3, [("stale", "from another direction", True, object())], None, 0)
+        assert pane._rows == rows
+
+    _run_pane(body)

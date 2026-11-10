@@ -1008,6 +1008,8 @@ def apply_sessions_to_claude(plan: SessionPlan, dry_run: bool = False) -> Sessio
         session_id = str(uuid.uuid4())
         try:
             turns, cwd, model = read_codex_rollout(Path(candidate.path))
+            if not cwd or not os.path.isabs(cwd) or not turns:
+                raise AgentImportError("rollout has no working directory or no conversation turns")
             lines = _claude_lines(turns, cwd, session_id, model, version)
             target = PROJECTS_DIR / encode_path(cwd) / f"{session_id}.jsonl"
             target.parent.mkdir(parents=True, exist_ok=True)

@@ -121,7 +121,7 @@ def _trash_related_session_envs(paths: list[Path]) -> None:
 
 
 def trash_single_session_file(project_encoded: str, session_id: str) -> bool:
-    """Move a single .jsonl session file to trash."""
+    """Move a session's .jsonl and its ``<id>/`` sidecar dir (subagents, tool results) to trash."""
     try:
         validate_identifier(project_encoded, "project directory")
         validate_identifier(session_id, "session id")
@@ -132,10 +132,15 @@ def trash_single_session_file(project_encoded: str, session_id: str) -> bool:
         return False
     try:
         project_root = _validate_path(PROJECTS_DIR / project_encoded, PROJECTS_DIR)
-        resolved = _validate_path(target, project_root)
-        _snapshot_or_raise(resolved, "session")
-        _log_trash(resolved, "session")
-        send2trash(str(resolved))
+        paths = [_validate_path(target, project_root)]
+        sidecar = project_root / session_id
+        if sidecar.is_dir() and not sidecar.is_symlink():
+            paths.append(_validate_path(sidecar, project_root))
+        for path in paths:
+            _snapshot_or_raise(path, "session")
+        for path in paths:
+            _log_trash(path, "session")
+            send2trash(str(path))
         return True
     except (ValueError, PermissionError, OSError) as e:
         logger.warning("Failed to trash session file %s: %s", session_id, e)

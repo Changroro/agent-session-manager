@@ -5,25 +5,24 @@ this module backs the heavier full-text pass that scans the actual conversation
 JSONL bodies so a query can find sessions where the term only appears mid-chat.
 
 ripgrep is used when available (fast, literal, case-insensitive) with a plain
-Python scan as a fallback. Claude stores one ``<session_id>.jsonl`` per project
-dir, so a content hit is identified by the file stem; Codex stores global
+Python scan as a fallback. Hits stream out as they are found and a scan is
+killed as soon as the caller cancels it. Claude stores ``<session_id>.jsonl``
+(plus ``<session_id>/subagents/*.jsonl``) per project dir, so a hit maps to the
+session id path component; Codex stores global
 ``rollout-*.jsonl`` files, identified by absolute path (matching
 ``SessionDetail.project_dir`` for Codex sessions).
 """
 
 from __future__ import annotations
 
-import shutil
 import re
+import shutil
 import subprocess
+import tempfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from asm.models import CODEX_SESSIONS_DIR, PROJECTS_DIR
-
-# Cap a single scan so a huge ~/.claude never freezes the filter box. ripgrep
-# finishes well under this on normal data; the Python fallback is bounded by
-# file count instead.
-_GREP_TIMEOUT = 15
 
 
 class SearchError(RuntimeError):
@@ -53,70 +52,111 @@ def _flexible_regex(query: str) -> str | None:
     return r"\s*".join(chars)
 
 
-def _ripgrep_files(query: str, root: Path, glob: str) -> list[Path] | None:
-    """Files under ``root`` matching ``glob`` whose body contains ``query``.
+def _never() -> bool:
+    return False
 
-    Whitespace-insensitive, case-insensitive. Returns ``None`` when ripgrep is
-    unavailable or fails so callers fall back to a Python scan.
-    """
-    rg = shutil.which("rg")
-    if rg is None:
-        return None
-    pattern = _flexible_regex(query)
-    if pattern is None:
-        return []
+
+def _iter_ripgrep(pattern: str, root: Path, glob: str, cancelled: Callable[[], bool]) -> Iterator[Path]:
+    """Yield matching files as ripgrep reports them; killed early when cancelled."""
+    # stderr to a file: a PIPE nobody drains can fill and stall ripgrep.
+    errfile = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        [shutil.which("rg"), "-l", "-i", "-e", pattern, "-g", glob, str(root)],
+        stdout=subprocess.PIPE,
+        stderr=errfile,
+        text=True,
+    )
     try:
-        proc = subprocess.run(
-            [rg, "-l", "-i", "-e", pattern, "-g", glob, str(root)],
-            capture_output=True,
-            text=True,
-            timeout=_GREP_TIMEOUT,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return None
-    # exit 0 = matches, 1 = no matches (empty stdout), 2 = error.
-    if proc.returncode not in (0, 1):
-        return None
-    return [Path(line) for line in proc.stdout.splitlines() if line]
+        for line in proc.stdout:
+            if cancelled():
+                return
+            if line := line.rstrip("\n"):
+                yield Path(line)
+        # exit 0 = matches, 1 = no matches, 2 = error (unreadable file, bad root).
+        if proc.wait() not in (0, 1):
+            errfile.seek(0)
+            detail = errfile.read().decode(errors="replace").strip()
+            raise SearchError(f"ripgrep failed under {root}: {detail}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+        errfile.close()
 
 
-def _python_grep_files(query: str, root: Path, glob: str) -> list[Path]:
-    """Fallback content scan without ripgrep (slower, bounded by file count)."""
+def _iter_python(query: str, root: Path, glob: str, cancelled: Callable[[], bool]) -> Iterator[Path]:
+    """Content scan for machines without ripgrep (slower)."""
     needle = normalize(query)
-    if not needle:
-        return []
-    hits: list[Path] = []
     try:
         for f in root.rglob(glob):
+            if cancelled():
+                return
             try:
                 with open(f, encoding="utf-8", errors="ignore") as fh:
                     if any(needle in normalize(line) for line in fh):
-                        hits.append(f)
+                        yield f
             except OSError as exc:
                 raise SearchError(f"cannot read search file {f}: {exc}") from exc
     except OSError as exc:
         raise SearchError(f"cannot read search root {root}: {exc}") from exc
-    return hits
+
+
+def _iter_grep(query: str, root: Path, glob: str, cancelled: Callable[[], bool] = _never) -> Iterator[Path]:
+    """Files under ``root`` matching ``glob`` whose body contains ``query``
+    (whitespace- and case-insensitive), streamed as they are found."""
+    pattern = _flexible_regex(query)
+    if pattern is None or not root.exists():
+        return
+    if shutil.which("rg"):
+        yield from _iter_ripgrep(pattern, root, glob, cancelled)
+    else:
+        yield from _iter_python(query, root, glob, cancelled)
 
 
 def _grep_files(query: str, root: Path, glob: str) -> list[Path]:
-    files = _ripgrep_files(query, root, glob)
-    if files is None:
-        files = _python_grep_files(query, root, glob)
-    return files
+    return list(_iter_grep(query, root, glob))
+
+
+def iter_claude_hits(query: str, cancelled: Callable[[], bool] = _never) -> Iterator[tuple[str, bool]]:
+    """``(session_id, via_subagent)`` for Claude transcripts containing ``query``.
+
+    A session may be yielded twice: once for a subagent transcript hit and once
+    for its own transcript, in whichever order ripgrep finds them.
+    """
+    seen: set[tuple[str, bool]] = set()
+    for f in _iter_grep(query.strip(), PROJECTS_DIR, "*.jsonl", cancelled):
+        try:
+            parts = f.relative_to(PROJECTS_DIR).parts
+        except ValueError:
+            continue
+        # <project>/<sid>.jsonl, or <project>/<sid>/subagents/agent-*.jsonl
+        if len(parts) < 2:
+            continue
+        hit = (parts[1].removesuffix(".jsonl"), len(parts) > 2)
+        if hit not in seen:
+            seen.add(hit)
+            yield hit
+
+
+def iter_claude_session_ids(query: str, cancelled: Callable[[], bool] = _never) -> Iterator[str]:
+    """Claude session ids whose transcript (or subagent transcript) contains ``query``."""
+    seen: set[str] = set()
+    for sid, _sub in iter_claude_hits(query, cancelled):
+        if sid not in seen:
+            seen.add(sid)
+            yield sid
+
+
+def iter_codex_rollout_paths(query: str, cancelled: Callable[[], bool] = _never) -> Iterator[str]:
+    """Absolute paths of Codex rollout files whose body contains ``query``."""
+    for f in _iter_grep(query.strip(), CODEX_SESSIONS_DIR, "rollout-*.jsonl", cancelled):
+        yield str(f)
 
 
 def search_claude_session_ids(query: str) -> set[str]:
-    """Claude session ids whose JSONL body contains ``query`` (case-insensitive)."""
-    query = query.strip()
-    if not query or not PROJECTS_DIR.exists():
-        return set()
-    return {f.stem for f in _grep_files(query, PROJECTS_DIR, "*.jsonl")}
+    return set(iter_claude_session_ids(query))
 
 
 def search_codex_rollout_paths(query: str) -> set[str]:
-    """Absolute paths of Codex rollout files whose body contains ``query``."""
-    query = query.strip()
-    if not query or not CODEX_SESSIONS_DIR.exists():
-        return set()
-    return {str(f) for f in _grep_files(query, CODEX_SESSIONS_DIR, "rollout-*.jsonl")}
+    return set(iter_codex_rollout_paths(query))

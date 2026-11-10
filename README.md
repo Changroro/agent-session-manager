@@ -62,7 +62,7 @@ same view filtered to **Claude** and to **Codex**:
 - **Orphan cleanup:** detect and bulk-clean Claude sessions, file-history, debug, and task entries with no matching project
 - **Duplicate sessions:** find the same session copied across projects and delete individual copies
 - **Empty sessions:** clean stub sessions that hold only a title/metadata and no conversation (can't be resumed)
-- **Migration:** copy Claude sessions between projects (originals preserved), with paths auto-rewritten
+- **Move / Copy:** move sessions to another project (same id; originals to trash with a recovery snapshot) or copy them under new ids (originals stay). Subagent/tool-result folders included, paths auto-rewritten
 
 ### Artifacts
 - Browse every page you've published with Claude Code's **Artifact tool** — scanned straight out of your session history, newest first
@@ -155,9 +155,9 @@ Data operations have headless subcommands for scripts and AI agents. Instruction
 # Read-only
 asm cost --period weekly          # Cost/token stats per model & period
 asm projects                      # All projects (Claude + Codex)
-asm sessions --search "firewall"  # Search sessions by title
+asm find "firewall"               # Find sessions by title + content (--only-title / --only-content)
 asm preview <session-id>          # Print a conversation
-asm resume <session-id>           # cd into its project & resume (Claude/Codex)
+asm resume <session-id>           # cd into its project & resume (Claude/Codex; --project if the id is duplicated)
 asm artifacts                     # Pages published via the Artifact tool
 asm import list --to claude       # Sessions that could be copied Codex -> Claude
 asm backup list / asm recovery list
@@ -168,7 +168,9 @@ asm clean empty --dry-run         # empty | orphaned | debug | todos
 asm trash <session-id>
 asm backup create --type full     # config|full|settings|plugins|sessions|codex
 asm backup restore <path> / asm recovery restore <id>
-asm migrate /old/project /new/project
+asm move /old/project /new/project                # move all its sessions (Claude + Codex); originals to trash
+asm move /old/project /new/project --sessions 3f2a1b9c   # only these (ids or unique prefixes)
+asm copy /old/project /new/project --sessions 3f2a1b9c   # duplicate under new session ids; originals stay
 asm import session <session-id>   # Copy one session; direction inferred from the id
 asm import mcp --to codex         # Copy MCP servers between agents
 ```

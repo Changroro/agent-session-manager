@@ -138,7 +138,8 @@ class BackupsPane(Container):
         recovery_table.add_columns("Name", "Created", "Type", "Status", "Original Path")
 
         self._render_actions()
-        self.refresh_data()
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.refresh_data()
 
     # ── Actions bar ──────────────────────────────────────────
 

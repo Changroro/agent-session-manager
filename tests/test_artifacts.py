@@ -91,3 +91,16 @@ def test_list_artifacts_finds_and_dedupes(tmp_path: Path):
 def test_list_artifacts_empty_tree(tmp_path: Path):
     with patch.object(artifacts, "PROJECTS_DIR", tmp_path / "none"):
         assert artifacts.list_artifacts() == []
+
+
+def test_replayed_request_blob_does_not_duplicate_or_crash(tmp_path: Path):
+    """Claude Code's api-request-blob records repeat earlier turns verbatim."""
+    projects = tmp_path / "projects"
+    rows = _artifact_lines(
+        "t1", "https://claude.ai/code/artifact/aaa-111", {"title": "Report"}, "2026-07-01T10:00:00Z"
+    )
+    blob = {"type": "api-request-blob", "message": rows[0]["message"]}
+    _write_session(projects / "-home-me-proj" / "sess-1.jsonl", [rows[0], blob, rows[1]])
+
+    with patch.object(artifacts, "PROJECTS_DIR", projects):
+        assert [a.title for a in artifacts.list_artifacts()] == ["Report"]

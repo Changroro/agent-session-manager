@@ -105,7 +105,8 @@ class FileHistoryPane(Container):
         self._all_entries = []
         self._encoded_to_path = {}
         self._session_to_project = {}
-        self.refresh_data()
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.refresh_data()
 
     def refresh_data(self) -> None:
         self.run_worker(self._load, thread=True)

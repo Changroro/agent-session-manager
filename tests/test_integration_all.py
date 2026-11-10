@@ -217,6 +217,83 @@ class TestCodexFeatures:
         assert all(s.session_id != "aaaa" for s in a)
         assert any(s.session_id == "aaaa" for s in b)
 
+    def test_move_codex_session_updates_state_db_and_keeps_subdirs(self, monkeypatch, tmp_path):
+        import sqlite3
+
+        env = _setup_fake_codex(monkeypatch, tmp_path)
+        rollout = codex_data.get_project_sessions("/work/proj-a")[0].project_dir
+        with open(rollout, "a") as fh:
+            fh.write(json.dumps({"type": "turn_context", "payload": {"cwd": "/work/proj-a/sub"}}) + "\n")
+            fh.write(json.dumps({"type": "turn_context", "payload": {"cwd": "/elsewhere"}}) + "\n")
+        db = env["codex_dir"] / "state_5.sqlite"
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT)")
+            conn.execute("INSERT INTO threads VALUES ('aaaa', ?, '/work/proj-a')", (rollout,))
+            conn.execute("INSERT INTO threads VALUES ('bbbb', 'x', '/work/proj-b')")
+
+        assert codex_data.move_session(rollout, "/work/proj-c/") is True
+
+        cwds = [
+            (json.loads(line).get("payload") or {}).get("cwd")
+            for line in Path(rollout).read_text().split("\n") if line
+        ]
+        assert "/work/proj-c" in cwds and "/work/proj-c/sub" in cwds and "/elsewhere" in cwds
+        assert "/work/proj-a" not in cwds
+        with sqlite3.connect(db) as conn:
+            assert dict(conn.execute("SELECT id, cwd FROM threads")) == {"aaaa": "/work/proj-c", "bbbb": "/work/proj-b"}
+
+    def test_move_codex_session_leaves_file_alone_when_db_locked(self, monkeypatch, tmp_path):
+        import sqlite3
+
+        env = _setup_fake_codex(monkeypatch, tmp_path)
+        rollout = codex_data.get_project_sessions("/work/proj-a")[0].project_dir
+        before = Path(rollout).read_text()
+        db = env["codex_dir"] / "state_5.sqlite"
+        locker = sqlite3.connect(db, isolation_level=None)
+        locker.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT)")
+        locker.execute("BEGIN EXCLUSIVE")
+        monkeypatch.setattr(sqlite3, "connect", lambda path, **kw: sqlite3.Connection(path, timeout=0.1, isolation_level=None))
+        try:
+            assert codex_data.move_session(rollout, "/work/proj-c") is False
+        finally:
+            locker.execute("ROLLBACK")
+            locker.close()
+        assert Path(rollout).read_text() == before
+
+    def test_copy_codex_session_new_id_db_row_and_zero_usage(self, monkeypatch, tmp_path):
+        import sqlite3
+
+        env = _setup_fake_codex(monkeypatch, tmp_path)
+        sess = env["sessions_dir"] / "2026" / "06" / "01"
+        old_id = "019ddddd-da44-7a72-8b78-912063531fae"
+        orig = sess / f"rollout-2026-06-01T09-00-00-{old_id}.jsonl"
+        orig.write_text("\n".join(json.dumps(r) for r in [
+            {"type": "session_meta", "payload": {"id": old_id, "cwd": "/work/proj-a"}},
+            {"type": "turn_context", "payload": {"cwd": "/work/proj-a/sub", "model": "gpt-5.5"}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 500, "output_tokens": 70, "total_tokens": 570}}}},
+        ]) + "\n")
+        before = orig.read_text()
+        db = env["codex_dir"] / "state_5.sqlite"
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT, tokens_used INTEGER)")
+            conn.execute("INSERT INTO threads VALUES (?, ?, '/work/proj-a', 't', 570)", (old_id, str(orig)))
+
+        new_id = codex_data.copy_session(str(orig), "/work/proj-c")
+
+        assert new_id and new_id != old_id
+        assert orig.read_text() == before
+        copy = sess / f"rollout-2026-06-01T09-00-00-{new_id}.jsonl"
+        recs = [json.loads(line) for line in copy.read_text().split("\n") if line]
+        assert recs[0]["payload"] == {"id": new_id, "cwd": "/work/proj-c"}
+        assert recs[1]["payload"]["cwd"] == "/work/proj-c/sub"
+        usage = recs[2]["payload"]["info"]["total_token_usage"]
+        assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 570}
+        with sqlite3.connect(db) as conn:
+            rows = dict((r[0], r[1:]) for r in conn.execute("SELECT id, rollout_path, cwd, title, tokens_used FROM threads"))
+        assert rows[old_id] == (str(orig), "/work/proj-a", "t", 570)
+        assert rows[new_id] == (str(copy), "/work/proj-c", "t", 0)
+
     def test_codex_backup_restore_roundtrip(self, monkeypatch, tmp_path):
         env = _setup_fake_codex(monkeypatch, tmp_path)
         path = backup_service.create_codex_backup()
@@ -286,6 +363,8 @@ class TestUIBothModes:
                 assert "tab-codex-sessions" not in ids
                 assert "tab-projects" in ids
 
+                app.action_tab("tab-projects")  # panes load on first view
+                await pilot.pause(); await asyncio.sleep(0.8); await pilot.pause()
                 pane = app.query_one("ProjectsPane")
                 assert "/work/proj-a" in pane._codex_paths
                 paths = {p.path for p in pane._all_projects}

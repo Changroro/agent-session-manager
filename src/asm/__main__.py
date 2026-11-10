@@ -12,7 +12,9 @@ _EXAMPLES = """\
 examples:
   asm                          open the TUI (Claude + Codex together)
   asm cost --period weekly     cost & token stats per model
-  asm sessions --search auth   find sessions by title
+  asm find auth                find sessions by title or content
+  asm move /old /new           move a project's sessions (originals to trash)
+  asm copy /old /new           copy them under new session ids (originals stay)
   asm resume <session-id>      cd into the session's project and resume it
   asm clean empty --dry-run    preview empty-session cleanup
   asm backup create --type full

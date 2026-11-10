@@ -47,7 +47,8 @@ class ArtifactsPane(Container):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_columns("Published", "Title", "Project", "URL")
-        self.refresh_data()
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.refresh_data()
 
     def refresh_data(self) -> None:
         self.run_worker(self._load, thread=True)

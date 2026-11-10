@@ -64,7 +64,8 @@ class AgentImportPane(Container):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_columns("Sel", "Item", "Detail", "Status")
-        self.refresh_data()
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.refresh_data()
 
     @property
     def _kind(self) -> str:
@@ -75,10 +76,11 @@ class AgentImportPane(Container):
         return DIRECTIONS[self._index][1]
 
     def refresh_data(self) -> None:
-        self.run_worker(self._load, thread=True)
+        index = self._index
+        self.run_worker(lambda: self._load(index), thread=True)
 
-    def _load(self) -> None:
-        kind, direction = DIRECTIONS[self._index]
+    def _load(self, index: int) -> None:
+        kind, direction = DIRECTIONS[index]
         error = None
         truncated = 0
         rows: list[tuple[str, str, bool, object]] = []
@@ -99,9 +101,11 @@ class AgentImportPane(Container):
                 rows += [(c.path, c.title, False, None) for c in plan.already_imported]
         except agent_import.AgentImportError as exc:
             error = str(exc)
-        self.app.call_from_thread(self._on_loaded, rows, error, truncated)
+        self.app.call_from_thread(self._on_loaded, index, rows, error, truncated)
 
-    def _on_loaded(self, rows, error, truncated) -> None:
+    def _on_loaded(self, index, rows, error, truncated) -> None:
+        if index != self._index:
+            return  # the user switched direction while this plan was loading
         self._rows = rows
         self._error = error
         self._truncated = truncated
@@ -166,17 +170,19 @@ class AgentImportPane(Container):
             self.app.notify(t("imp.nothing"))
             return
 
+        index = self._index  # the rows shown belong to this direction
+
         def on_confirm(confirmed: bool) -> None:
             if confirmed:
-                self.run_worker(lambda: self._apply(chosen), thread=True)
+                self.run_worker(lambda: self._apply(chosen, index), thread=True)
 
         self.app.push_screen(
             ConfirmScreen(t("imp.confirm", count=len(chosen), mode=self._direction)),
             on_confirm,
         )
 
-    def _apply(self, chosen) -> None:
-        kind, direction = DIRECTIONS[self._index]
+    def _apply(self, chosen, index: int) -> None:
+        kind, direction = DIRECTIONS[index]
         try:
             if kind == "mcp":
                 plan = agent_import.McpPlan(

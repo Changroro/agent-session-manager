@@ -806,3 +806,20 @@ def test_title_skips_hash_prefixed_preamble(claude_session):
 
     turns, _cwd, _tokens = agent_import.read_claude_session(target)
     assert agent_import._title_of(turns) == "실제 질문"
+
+
+def test_apply_to_claude_refuses_candidate_without_cwd(codex_rollout, monkeypatch):
+    """A wrong-direction candidate (e.g. a Claude transcript) must not land in projects/ root."""
+    from asm.services import backup
+
+    monkeypatch.setattr(backup, "create_sessions_backup", lambda: None)
+    monkeypatch.setattr(agent_import, "claude_cli_version", lambda: "2.1.228")
+    stray = codex_rollout.parent / "not-a-rollout.jsonl"
+    stray.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+    candidate = agent_import.plan_sessions_to_claude().new[0]
+    candidate.path = str(stray)
+
+    result = agent_import.apply_sessions_to_claude(agent_import.SessionPlan(new=[candidate]))
+
+    assert result.imported == [] and len(result.failed) == 1
+    assert not list(agent_import.PROJECTS_DIR.glob("*.jsonl"))

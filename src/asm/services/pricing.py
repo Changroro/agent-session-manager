@@ -71,22 +71,26 @@ def _validate_live_db(data) -> dict[str, dict]:
     if not isinstance(data, dict):
         raise PricingDataError("pricing payload must be an object")
     result: dict[str, dict] = {}
+    invalid: list[str] = []
     for key, entry in data.items():
         if not isinstance(key, str) or not isinstance(entry, dict):
             continue
         relevant = _relevant_entry(key)
         if not relevant:
             continue
-        for field in ("input_cost_per_token", "output_cost_per_token"):
-            value = entry.get(field)
-            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-                raise PricingDataError(f"invalid {field} for pricing model {key}")
-        for field in ("cache_read_input_token_cost", "cache_creation_input_token_cost"):
-            if field in entry:
-                value = entry[field]
-                if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-                    raise PricingDataError(f"invalid {field} for pricing model {key}")
-        result[key] = entry
+        fields = ["input_cost_per_token", "output_cost_per_token"] + [
+            f for f in ("cache_read_input_token_cost", "cache_creation_input_token_cost") if f in entry
+        ]
+        if all(
+            isinstance(entry.get(f), (int, float)) and math.isfinite(entry[f]) and entry[f] >= 0
+            for f in fields
+        ):
+            result[key] = entry
+        else:
+            invalid.append(key)
+    # One malformed third-party entry must not discard every live rate.
+    if invalid:
+        logger.info("Ignoring %d invalid pricing entries: %s", len(invalid), ", ".join(invalid[:5]))
     return result
 
 
@@ -229,6 +233,8 @@ def _rates_for(model: str) -> tuple[float, float, float, float]:
         return _FABLE
     if "haiku" in name:
         return _HAIKU
+    if "sonnet" in name:
+        return _SONNET if any(m in name for m in ("sonnet-3", "sonnet-4")) else _SONNET_5
     raise PricingDataError(f"unknown Claude model: {model}")
 
 

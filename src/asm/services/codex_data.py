@@ -393,50 +393,110 @@ def get_all_period_usage() -> dict[str, list[dict]]:
     return {p: get_period_usage(p) for p in ("daily", "weekly", "monthly")}
 
 
-def _retarget_cwd(obj, new_cwd: str) -> bool:
-    """Recursively set every ``cwd`` string field in a JSON object to new_cwd."""
+def _retarget_cwd(obj, old_cwd: str, new_cwd: str) -> bool:
+    """Recursively move every ``cwd`` at or under ``old_cwd`` to ``new_cwd``."""
+    from asm.services.migrate import _path_replacement
+
     changed = False
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == "cwd" and isinstance(v, str):
-                if v != new_cwd:
-                    obj[k] = new_cwd
+                moved = _path_replacement(v, old_cwd, new_cwd)
+                if moved != v:
+                    obj[k] = moved
                     changed = True
             elif isinstance(v, (dict, list)):
-                changed = _retarget_cwd(v, new_cwd) or changed
+                changed = _retarget_cwd(v, old_cwd, new_cwd) or changed
     elif isinstance(obj, list):
         for item in obj:
             if isinstance(item, (dict, list)):
-                changed = _retarget_cwd(item, new_cwd) or changed
+                changed = _retarget_cwd(item, old_cwd, new_cwd) or changed
     return changed
 
 
+def _state_dbs() -> list[Path]:
+    """Codex's thread state databases (``state_<n>.sqlite``) beside the sessions dir."""
+    return sorted(CODEX_SESSIONS_DIR.parent.glob("state_*.sqlite"))
+
+
 def move_session(rollout_path: str, new_cwd: str) -> bool:
-    """Re-assign a Codex session to a different working directory.
+    """Re-assign a Codex session to a different working directory (same id).
 
     Codex sessions are global, date-partitioned rollouts whose owning project is
-    recorded as ``cwd`` in the session_meta (Codex resumes by cwd, e.g.
-    ``codex resume --cd <dir>``). "Moving" rewrites that cwd; the file stays in
-    its date folder. A recovery snapshot is taken first. Returns True if changed.
+    recorded as ``cwd`` in the session_meta and mirrored in the ``threads`` table
+    of ``state_<n>.sqlite`` (what ``codex resume`` lists from). Both are rewritten
+    together: DB rows are updated inside an open transaction that commits only
+    after the rollout write succeeds. Sub-directory cwds keep their suffix. A
+    recovery snapshot is taken first. Returns True if changed.
     """
+    return _relocate(rollout_path, new_cwd, copy=False) is not None
+
+
+def copy_session(rollout_path: str, new_cwd: str) -> str | None:
+    """Duplicate a Codex session under ``new_cwd`` with a fresh thread id.
+
+    The original is untouched. The copy is a new rollout file beside it plus a
+    cloned ``threads`` row; its token counters are zeroed so asm never prices the
+    same conversation twice. Returns the new id, or None on failure.
+    """
+    return _relocate(rollout_path, new_cwd, copy=True)
+
+
+def _zero_usage(record: dict) -> None:
+    payload = record.get("payload")
+    if record.get("type") != "event_msg" or not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return
+    for key in ("total_token_usage", "last_token_usage"):
+        usage = info.get(key)
+        if isinstance(usage, dict):
+            for field in usage:
+                if field != "total_tokens" and isinstance(usage[field], (int, float)):
+                    usage[field] = 0
+
+
+def _replace_value(obj, old: str, new: str) -> None:
+    """Replace every string value equal to ``old`` (the thread id) with ``new``."""
+    items = obj.items() if isinstance(obj, dict) else enumerate(obj) if isinstance(obj, list) else ()
+    for k, v in list(items):
+        if v == old:
+            obj[k] = new
+        elif isinstance(v, (dict, list)):
+            _replace_value(v, old, new)
+
+
+def _relocate(rollout_path: str, new_cwd: str, copy: bool) -> str | None:
+    """Shared move/copy: returns the session id in the new location, None on failure/no-op."""
+    import os
+    import sqlite3
+    import uuid
+
+    from asm.services.migrate import _path_replacement
     from asm.services.recovery import create_recovery_snapshot
 
     p = Path(rollout_path)
+    new_cwd = os.path.normpath(new_cwd)
     if not p.exists():
-        return False
+        return None
     # Defense-in-depth: only operate on real files under the Codex sessions dir
     # (parity with the sibling trash function), even though callers pass scanned
     # rollouts. Uses the module-level dir so it follows test/patched roots.
     try:
         root = CODEX_SESSIONS_DIR.resolve()
         if p.is_symlink() or not p.resolve().is_relative_to(root):
-            logger.warning("Refusing to move session outside Codex sessions dir: %s", rollout_path)
-            return False
+            logger.warning("Refusing to touch session outside Codex sessions dir: %s", rollout_path)
+            return None
     except OSError:
-        return False
+        return None
+    conns: list[sqlite3.Connection] = []
+    target = p
+    created = False
     try:
-        out, changed = [], False
-        for line in p.read_text().splitlines():
+        records = []
+        # split("\n"), not splitlines(): U+2028 etc. may appear inside JSON strings.
+        for line in p.read_text(encoding="utf-8").split("\n"):
             if not line.strip():
                 continue
             try:
@@ -445,18 +505,77 @@ def move_session(rollout_path: str, new_cwd: str) -> bool:
                 raise CodexDataError(f"malformed rollout: {p}") from exc
             if not isinstance(obj, dict):
                 raise CodexDataError(f"unexpected rollout record: {p}")
-            if _retarget_cwd(obj, new_cwd):
-                changed = True
-            out.append(json.dumps(obj, ensure_ascii=False))
-        if changed:
-            snapshot_id = create_recovery_snapshot(p, "codex-session")
-            if not snapshot_id:
-                return False
-            _atomic_write_text(p, "\n".join(out) + "\n")
-            refresh()
-        return changed
-    except (OSError, CodexDataError):
-        return False
+            records.append(obj)
+        meta = next((r.get("payload") for r in records if r.get("type") == "session_meta"), None)
+        old_cwd = meta.get("cwd") if isinstance(meta, dict) else None
+        old_id = (meta.get("id") or "") if isinstance(meta, dict) else ""
+        if not old_cwd or (copy and not old_id):
+            raise CodexDataError(f"rollout has no session_meta cwd/id: {p}")
+        changed = False
+        for obj in records:
+            changed = _retarget_cwd(obj, old_cwd, new_cwd) or changed
+        new_id = old_id
+        if copy:
+            new_id = str(uuid.uuid4())
+            for obj in records:
+                _replace_value(obj, old_id, new_id)
+                _zero_usage(obj)
+            if not p.name.endswith(f"-{old_id}.jsonl"):
+                raise CodexDataError(f"rollout name does not end with its id: {p}")
+            target = p.with_name(p.name[: -len(f"{old_id}.jsonl")] + f"{new_id}.jsonl")
+        elif not changed:
+            return None
+        for db in _state_dbs():
+            conn = sqlite3.connect(db, timeout=5, isolation_level=None)
+            conns.append(conn)
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'").fetchone():
+                continue
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT id, cwd FROM threads WHERE id = ? OR rollout_path = ?", (old_id, str(p))
+            ).fetchall()
+            for row_id, row_cwd in rows:
+                moved_cwd = _path_replacement(row_cwd, old_cwd, new_cwd)
+                if not copy:
+                    conn.execute("UPDATE threads SET cwd = ? WHERE id = ?", (moved_cwd, row_id))
+                    continue
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(threads)")]
+                overrides = {"id": new_id, "rollout_path": str(target), "cwd": moved_cwd}
+                if "tokens_used" in cols:
+                    overrides["tokens_used"] = 0
+                select = ", ".join("?" if c in overrides else f'"{c}"' for c in cols)
+                params = [overrides[c] for c in cols if c in overrides]
+                quoted = ", ".join(f'"{c}"' for c in cols)
+                conn.execute(
+                    f"INSERT INTO threads ({quoted}) SELECT {select} FROM threads WHERE id = ?",
+                    (*params, row_id),
+                )
+        text = "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n"
+        if copy:
+            if target.exists():
+                raise CodexDataError(f"copy target already exists: {target}")
+            created = True
+            _atomic_write_text(target, text)
+        else:
+            if not create_recovery_snapshot(p, "codex-session"):
+                raise CodexDataError(f"recovery snapshot failed: {p}")
+            _atomic_write_text(p, text)
+        for conn in conns:
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+        refresh()
+        return new_id
+    except (OSError, CodexDataError, sqlite3.Error) as exc:
+        logger.warning("Codex session %s failed for %s: %s", "copy" if copy else "move", rollout_path, exc)
+        for conn in conns:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        if created and target.exists():
+            target.unlink()
+        return None
+    finally:
+        for conn in conns:
+            conn.close()
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -466,7 +585,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.replace(tmp, path)
     except OSError:

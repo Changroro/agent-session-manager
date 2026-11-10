@@ -10,7 +10,7 @@ asm은 마우스 없이 키보드만으로 모든 TUI 기능을 사용할 수 �
 | `F2` | Projects 탭 |
 | `F3` | File History 탭 |
 | `F4` | Debug/Todos 탭 |
-| `F5` | Migrate 탭 |
+| `F5` | 이동/복사 탭 (Move · Copy) |
 | `F6` | Backups 탭 |
 | `F7` | Artifacts 탭 |
 | `F8` | Claude↔Codex 탭 |

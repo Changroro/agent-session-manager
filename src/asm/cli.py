@@ -115,7 +115,7 @@ def _src_cell(src: str):
     from rich.text import Text
 
     # Same source colors as the TUI (Claude orange / Codex teal).
-    return Text("C", style="#D97757") if src == "claude" else Text("X", style="#10A37F")
+    return Text("claude", style="#D97757") if src == "claude" else Text("codex", style="#10A37F")
 
 
 def _sources(source: str) -> list[str]:
@@ -285,13 +285,85 @@ def cmd_projects(args) -> int:
     return 0
 
 
-def cmd_sessions(args) -> int:
+def _short_ids(ids) -> dict[str, str]:
+    """Shortest prefix (at least 8 chars) that is unique among ``ids``."""
+    ordered = sorted(set(ids))
+    out: dict[str, str] = {}
+    for i, sid in enumerate(ordered):
+        common = 0
+        for other in (ordered[i - 1] if i else "", ordered[i + 1] if i + 1 < len(ordered) else ""):
+            n = 0
+            while n < min(len(sid), len(other)) and sid[n] == other[n]:
+                n += 1
+            common = max(common, n)
+        out[sid] = sid[: max(8, common + 1)]
+    return out
+
+
+def _resolve_session_id(sid: str) -> str:
+    """Full Claude/Codex session id for a full id or a unique prefix of one."""
+    import glob
+
+    from asm.models import PROJECTS_DIR
+    from asm.services import codex_data
+    from asm.utils import validate_identifier
+
+    validate_identifier(sid, "session id")
+    if len(sid) >= 36:
+        return sid
+    found: set[str] = set()
+    if PROJECTS_DIR.exists():
+        for d in PROJECTS_DIR.iterdir():
+            if d.is_dir():
+                found.update(f.stem for f in d.glob(f"{glob.escape(sid)}*.jsonl"))
+    if codex_data.is_available():
+        for f in codex_data._rollout_files():
+            full = f.name[-42:-6]  # rollout-<timestamp>-<36-char id>.jsonl
+            if full.startswith(sid):
+                found.add(full)
+    if len(found) > 1:
+        raise AmbiguousSessionError(
+            f"id prefix {sid} matches several sessions: {', '.join(sorted(found)[:5])}"
+        )
+    return found.pop() if found else sid
+
+
+def cmd_find(args) -> int:
+    """List sessions, optionally matching a query in titles and/or conversation bodies."""
+    from asm.services import search
+
+    query = (args.query or "").strip()
     rows = _tagged_sessions(args.source, args.project)
-    if args.search:
-        q = args.search.casefold()
-        rows = [r for r in rows if q in (r[0].summary or "").casefold()]
+    short = _short_ids(s.session_id for s, _src, _path in rows)
+    matched: list[tuple] = []
+    if query:
+        nq = search.normalize(query)
+        main: set[str] = set()
+        sub: set[str] = set()
+        codex_paths: set[str] = set()
+        if not args.only_title:
+            srcs = _sources(args.source)
+            if "claude" in srcs:
+                for sid, via_sub in search.iter_claude_hits(query):
+                    (sub if via_sub else main).add(sid)
+            if "codex" in srcs:
+                codex_paths = set(search.iter_codex_rollout_paths(query))
+        for s, src, path in rows:
+            if not args.only_content and nq in search.normalize(s.summary or ""):
+                where = "title"
+            elif src == "claude" and s.session_id in main:
+                where = "content"
+            elif src == "claude" and s.session_id in sub:
+                where = "sub-agent"
+            elif src == "codex" and s.project_dir in codex_paths:
+                where = "content"
+            else:
+                continue
+            matched.append((s, src, path, where))
+    else:
+        matched = [(s, src, path, "") for s, src, path in rows]
     if args.limit:
-        rows = rows[: args.limit]
+        matched = matched[: args.limit]
 
     if args.json:
         _out_json([
@@ -300,41 +372,42 @@ def cmd_sessions(args) -> int:
                 "source": src,
                 "project": path,
                 "title": s.summary,
+                "match": where,
                 "modified": _fmt_ts(s.last_modified),
                 "size_bytes": s.file_size,
             }
-            for s, src, path in rows
+            for s, src, path, where in matched
         ])
         return 0
     if sys.stdout.isatty():
         # project before title: a long title would otherwise fold and push the
-        # project column (needed to resume) off-screen. Resume needs the cwd —
-        # `claude -r <id>` only finds a session in its own project directory.
+        # project column (needed to resume) off-screen.
         _print_table(
-            f"{len(rows)} sessions", ["src", "modified", "project", "session id", "title"],
+            f"{len(matched)} sessions", ["src", "modified", "id", "match", "project", "title"],
             [(
-                _src_cell(src), _fmt_ts(s.last_modified), path, s.session_id,
+                _src_cell(src), _fmt_ts(s.last_modified), short[s.session_id], where, path,
                 (s.summary or "").replace("\n", " ")[:_TITLE_WIDTH],
-            ) for s, src, path in rows],
+            ) for s, src, path, where in matched],
         )
         from rich.console import Console
         Console().print(
-            "[dim]Resume any session: [/][cyan]asm resume <session id>[/]"
-            "[dim]  (cds into its project automatically; Claude and Codex)[/]"
+            "[dim]Use the id with: [/][cyan]asm resume <id>[/][dim] · [/][cyan]asm preview <id>[/]"
+            "[dim] · [/][cyan]asm move <from> <to> --sessions <id>[/]"
         )
         return 0
 
-    for s, src, path in rows:
+    for s, src, path, where in matched:
         title = (s.summary or "").replace("\n", " ")[:_TITLE_WIDTH]
-        mark = "C" if src == "claude" else "X"
-        print(f"{mark} {_fmt_ts(s.last_modified)}  {s.session_id}  {title}  ({path})")
-    print(f"\n{len(rows)} sessions")
+        tag = f" [{where}]" if where else ""
+        print(f"{src:<6} {_fmt_ts(s.last_modified)}  {short[s.session_id]}{tag}  {title}  ({path})")
+    print(f"\n{len(matched)} sessions")
     return 0
 
 
 def cmd_preview(args) -> int:
     from asm.services import claude_data, codex_data
 
+    args.session_id = _resolve_session_id(args.session_id)
     # Resolve the owning project dir up front so the direct JSONL path is used
     # (the SDK lookup returns [] for ids it can't find instead of raising).
     project = args.project or _find_claude_project_dir(args.session_id, args.project)
@@ -450,11 +523,18 @@ def cmd_resume(args) -> int:
     """
     from asm.models import PROJECTS_DIR, decode_path_hint
 
-    sid = args.session_id
+    sid = args.session_id = _resolve_session_id(args.session_id)
 
-    enc = _find_claude_project_dir(sid)
+    enc = _find_claude_project_dir(sid, args.project)
     if enc:
-        cwd = _read_claude_session_cwd(PROJECTS_DIR / enc / f"{sid}.jsonl") or decode_path_hint(enc)
+        from asm.services import claude_data
+
+        cwd = (
+            _read_claude_session_cwd(PROJECTS_DIR / enc / f"{sid}.jsonl")
+            or (args.project if args.project and args.project.startswith("/") else None)
+            or next(iter(claude_data.project_paths_for_encoded(enc)), None)
+            or decode_path_hint(enc)  # lossy: last resort only
+        )
         return _exec_resume(["claude", "-r", sid], cwd, args.dry_run)
 
     from asm.services import codex_data
@@ -686,12 +766,13 @@ def cmd_recovery(args) -> int:
     return 1
 
 
-# ── trash / migrate ─────────────────────────────────────────────────────
+# ── trash / move ─────────────────────────────────────────────────────
 
 
 def cmd_trash(args) -> int:
     from asm.services import cleaner, codex_data
 
+    args.session_id = _resolve_session_id(args.session_id)
     encoded_dir = _find_claude_project_dir(args.session_id, args.project)
     if encoded_dir:
         if not _confirm(f"Trash Claude session {args.session_id} ({encoded_dir})?", args.yes):
@@ -717,27 +798,90 @@ def cmd_trash(args) -> int:
     return 1
 
 
-def cmd_migrate(args) -> int:
-    from asm.models import encode_path
-    from asm.services import migrate
+def cmd_move(args) -> int:
+    """Move a project's Claude and Codex sessions (all, or --sessions) to another path."""
+    return _move_or_copy(args, copy=False)
 
+
+def cmd_copy(args) -> int:
+    """Duplicate sessions into another path under new ids; originals stay."""
+    return _move_or_copy(args, copy=True)
+
+
+def _move_or_copy(args, copy: bool) -> int:
+    import os
+
+    from asm.models import PROJECTS_DIR, encode_path
+    from asm.services import codex_data, migrate
+
+    src, dest = os.path.normpath(args.src), os.path.normpath(args.dest)
+    if src == dest:
+        _result(args, {"error": "source and destination are the same"}, "source and destination are the same", error=True)
+        return 1
+    claude_dir = PROJECTS_DIR / encode_path(src)
+    claude_all = {f.stem for f in claude_dir.glob("*.jsonl")} if claude_dir.is_dir() else set()
+    codex_all = (
+        {s.session_id: s.project_dir for s in codex_data.get_project_sessions(src)}
+        if codex_data.is_available() else {}
+    )
+    if args.sessions:
+        claude_sel: list[str] = []
+        codex_sel: list[str] = []
+        for raw in args.sessions:
+            cands = {i for i in claude_all | set(codex_all) if i.startswith(raw)}
+            if len(cands) != 1:
+                why = "not found" if not cands else "ambiguous"
+                msg = f"session {raw} {why} in {src}" + (f": {', '.join(sorted(cands)[:5])}" if cands else "")
+                _result(args, {"error": msg}, msg, error=True)
+                return 1
+            sid = cands.pop()
+            (claude_sel if sid in claude_all else codex_sel).append(sid)
+    else:
+        claude_sel, codex_sel = sorted(claude_all), sorted(codex_all)
+    if not claude_sel and not codex_sel:
+        _result(args, {"error": f"no sessions in {src}"}, f"no sessions in {src}", error=True)
+        return 1
+
+    verb = "Copy" if copy else "Move"
+    note = "(copies get new session ids; originals stay)" if copy else "(originals go to trash with a recovery snapshot)"
     if not _confirm(
-        f"Migrate sessions {args.src} -> {args.dest}"
-        + (f" ({len(args.sessions)} selected)" if args.sessions else " (all)") + "?",
+        f"{verb} {len(claude_sel)} Claude + {len(codex_sel)} Codex session(s)\n  {src}\n  -> {dest}\n{note}?",
         args.yes,
     ):
         _result(args, {"error": "cancelled"}, "cancelled", error=True)
         return 1
-    result = migrate.migrate_sessions(
-        source_path=args.src,
-        target_path=args.dest,
-        source_encoded=encode_path(args.src),
-        target_encoded=encode_path(args.dest),
-        session_ids=args.sessions,
-    )
-    message = f"{'ok' if result.success else 'failed'}: {result.sessions_copied} session(s) copied" + (f" — {result.message}" if result.message else "")
-    _result(args, {"success": result.success, "sessions_copied": result.sessions_copied, "sessions_skipped": result.sessions_skipped, "message": result.message}, message, error=not result.success)
-    return 0 if result.success else 1
+
+    payload: dict = {"from": src, "to": dest}
+    ok = True
+    lines = []
+    done = "copied" if copy else "moved"
+    if claude_sel:
+        r = migrate.migrate_sessions(source_path=src, target_path=dest, session_ids=claude_sel, copy=copy)
+        ok = ok and r.success
+        payload["claude"] = {
+            "success": r.success, done: r.sessions_copied, "skipped": r.sessions_skipped,
+            "ids": r.new_ids, "message": r.message,
+        }
+        lines.append(f"Claude: {'ok' if r.success else 'failed'} — {r.message}")
+    if codex_sel:
+        ids: dict[str, str] = {}
+        failed = []
+        for sid in codex_sel:
+            if copy:
+                new_id = codex_data.copy_session(codex_all[sid], dest)
+            else:
+                new_id = sid if codex_data.move_session(codex_all[sid], dest) else None
+            if new_id:
+                ids[sid] = new_id
+            else:
+                failed.append(sid)
+        ok = ok and not failed
+        payload["codex"] = {done: len(ids), "failed": failed, "ids": ids}
+        shown = ", ".join(f"{a[:8]} -> {b[:8]}" for a, b in ids.items()) if copy else ""
+        lines.append(f"Codex: {len(ids)} {done}" + (f" ({shown})" if shown else "") + (f", failed: {', '.join(failed)}" if failed else ""))
+    payload["success"] = ok
+    _result(args, payload, "\n".join(lines), error=not ok)
+    return 0 if ok else 1
 
 
 # ── parser wiring ───────────────────────────────────────────────────────
@@ -910,13 +1054,16 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     _common(p)
     p.set_defaults(func=cmd_projects)
 
-    p = sub.add_parser("sessions", help="list/search sessions by title")
+    p = sub.add_parser("find", help="find sessions by title and conversation content")
+    p.add_argument("query", nargs="?", help="text to find (spaces/case ignored); omit to list recent sessions")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--only-title", action="store_true", help="match session titles only")
+    scope.add_argument("--only-content", action="store_true", help="match conversation bodies only")
     p.add_argument("--project", help="limit to one project path")
-    p.add_argument("--search", help="substring match on session title")
     p.add_argument("--source", choices=["all", "claude", "codex"], default="all")
     p.add_argument("--limit", type=_non_negative_int, default=50, help="max rows (default 50, 0 = all)")
     _common(p)
-    p.set_defaults(func=cmd_sessions)
+    p.set_defaults(func=cmd_find)
 
     p = sub.add_parser("preview", help="print a session's conversation")
     p.add_argument("session_id")
@@ -932,6 +1079,7 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
 
     p = sub.add_parser("resume", help="cd into a session's project and resume it (Claude/Codex)")
     p.add_argument("session_id")
+    p.add_argument("--project", help="project path or encoded dir, when the id exists in several projects")
     p.add_argument("--dry-run", action="store_true", help="print the command + cwd instead of running it")
     p.set_defaults(func=cmd_resume)
 
@@ -1011,13 +1159,21 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     _common(p)
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("migrate", help="copy sessions to another project path")
-    p.add_argument("src", help="source project path")
-    p.add_argument("dest", help="target project path")
-    p.add_argument("--sessions", nargs="+", help="session ids (default: all)")
+    p = sub.add_parser("move", help="move sessions from one project path to another (originals to trash)")
+    p.add_argument("src", help="project path the sessions belong to now")
+    p.add_argument("dest", help="project path to move them to")
+    p.add_argument("--sessions", nargs="+", help="session ids or unique id prefixes (default: all in src)")
     p.add_argument("--yes", action="store_true", help="skip confirmation")
     _common(p)
-    p.set_defaults(func=cmd_migrate)
+    p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser("copy", help="copy sessions to another project path under new session ids (originals stay)")
+    p.add_argument("src", help="project path the sessions belong to")
+    p.add_argument("dest", help="project path to copy them to")
+    p.add_argument("--sessions", nargs="+", help="session ids or unique id prefixes (default: all in src)")
+    p.add_argument("--yes", action="store_true", help="skip confirmation")
+    _common(p)
+    p.set_defaults(func=cmd_copy)
 
 
 def run_cli(args) -> int:

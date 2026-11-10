@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections import defaultdict
 from pathlib import Path
 
@@ -90,7 +91,12 @@ def load_claude_json() -> dict:
 
 
 def get_projects() -> list[ProjectInfo]:
-    """Get all projects from .claude.json."""
+    """Projects from .claude.json plus session dirs whose project isn't registered.
+
+    Claude only registers a path in .claude.json once it runs there, so sessions
+    moved into a new project (or kept after a config cleanup) would otherwise be
+    invisible to listing and search.
+    """
     data = load_claude_json()
     projects_data = data.get("projects", {})
     result = []
@@ -105,7 +111,40 @@ def get_projects() -> list[ProjectInfo]:
                 session_env_dirs=_get_session_envs(path_str),
             )
         )
+    registered = _build_encoded_to_paths_map()
+    if PROJECTS_DIR.exists():
+        try:
+            dirs = sorted(d for d in PROJECTS_DIR.iterdir() if d.is_dir() and d.name not in registered)
+        except OSError as exc:
+            raise ClaudeDataError(f"cannot read {PROJECTS_DIR}: {exc}") from exc
+        for d in dirs:
+            cwd = _dir_project_path(d)
+            if cwd:
+                result.append(ProjectInfo(path=cwd, exists=Path(cwd).exists()))
     return result
+
+
+def _dir_project_path(project_dir: Path, max_lines: int = 200) -> str | None:
+    """The project path a session dir belongs to, from a recorded ``cwd`` whose
+    encoding matches the dir name (sub-dir cwds don't match and are skipped)."""
+    try:
+        sessions = sorted(project_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for jsonl in sessions[:5]:
+            with open(jsonl, "rb") as f:
+                for i, line in enumerate(f):
+                    if i >= max_lines:
+                        break
+                    if b'"cwd"' not in line:
+                        continue
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except (json.JSONDecodeError, UnicodeError, AttributeError):
+                        continue
+                    if isinstance(cwd, str) and cwd and encode_path(cwd) == project_dir.name:
+                        return cwd
+    except OSError as exc:
+        raise ClaudeDataError(f"cannot read {project_dir}: {exc}") from exc
+    return None
 
 
 def get_project_paths() -> set[str]:
@@ -114,12 +153,28 @@ def get_project_paths() -> set[str]:
     return set(data.get("projects", {}).keys())
 
 
+_encoded_map_cache: tuple[tuple, dict[str, list[str]]] | None = None
+
+
 def _build_encoded_to_paths_map() -> dict[str, list[str]]:
-    """Build encoded project-dir name -> project paths mapping."""
+    """Build encoded project-dir name -> project paths mapping.
+
+    Memoized on the .claude.json stat: the UI asks for it once per tree node,
+    and re-parsing the (often 500KB+) file each time froze the filter box.
+    """
+    global _encoded_map_cache
+    try:
+        st = CLAUDE_JSON.stat()
+        key = (str(CLAUDE_JSON), st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        key = (str(CLAUDE_JSON), None, None)
+    if _encoded_map_cache is not None and _encoded_map_cache[0] == key:
+        return {k: list(v) for k, v in _encoded_map_cache[1].items()}
     encoded_to_paths: dict[str, list[str]] = defaultdict(list)
     for path_str in sorted(get_project_paths()):
         encoded_to_paths[encode_path(path_str)].append(path_str)
-    return dict(encoded_to_paths)
+    _encoded_map_cache = (key, dict(encoded_to_paths))
+    return {k: list(v) for k, v in encoded_to_paths.items()}
 
 
 def project_paths_for_encoded(dir_name: str) -> list[str]:
@@ -161,7 +216,7 @@ def _project_label_for_dir(dir_name: str, encoded_to_paths: dict[str, list[str]]
         return matches[0]
     if len(matches) > 1:
         return f"[ambiguous] {' | '.join(matches)}"
-    return decode_path_hint(dir_name)
+    return _dir_project_path(PROJECTS_DIR / dir_name) or decode_path_hint(dir_name)
 
 
 def get_sessions() -> list[SessionInfo]:
@@ -174,8 +229,10 @@ def get_sessions() -> list[SessionInfo]:
         for d in sorted(PROJECTS_DIR.iterdir()):
             if not d.is_dir():
                 continue
-            actual_path = d.name
-            is_orphaned = actual_path not in encoded_to_paths
+            # Unregistered but its project still exists on disk → live, not orphaned.
+            is_orphaned = d.name not in encoded_to_paths and not (
+                (cwd := _dir_project_path(d)) and Path(cwd).exists()
+            )
 
             result.append(
                 SessionInfo(
@@ -806,6 +863,7 @@ def get_project_sessions(project_path: str) -> list[SessionDetail]:
     index = _load_session_index(project_dir)
 
     result = []
+    fresh: list[tuple[str, int, int, str, str]] = []
     for jsonl in project_dir.glob("*.jsonl"):
         try:
             stat = jsonl.stat()
@@ -818,7 +876,7 @@ def get_project_sessions(project_path: str) -> list[SessionDetail]:
             first_prompt = (meta.get("firstPrompt") or "")[:SUMMARY_MAX_CHARS]
             git_branch = meta.get("gitBranch", "") or ""
         else:
-            first_prompt, ai_title = _scan_jsonl_summary(jsonl)
+            first_prompt, ai_title = _cached_summary(jsonl, stat, fresh)
             summary = ai_title or first_prompt or f"(session {session_id[:8]})"
             git_branch = ""
         result.append(
@@ -832,8 +890,35 @@ def get_project_sessions(project_path: str) -> list[SessionDetail]:
                 project_dir=encoded,
             )
         )
+    if fresh:
+        from asm.services import ledger
+
+        ledger.store_claude_titles(fresh)
     result.sort(key=lambda s: s.last_modified, reverse=True)
     return result
+
+
+_title_cache: dict[str, tuple[int, int, str, str]] | None = None
+_title_lock = threading.Lock()
+
+
+def _cached_summary(jsonl: Path, stat: os.stat_result, fresh: list) -> tuple[str, str]:
+    """(first_prompt, ai_title), re-scanning the file only when its mtime/size changed."""
+    global _title_cache
+    from asm.services import ledger
+
+    with _title_lock:
+        if _title_cache is None:
+            _title_cache = ledger.claude_titles()
+        hit = _title_cache.get(str(jsonl))
+    if hit and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size:
+        return hit[2], hit[3]
+    first_prompt, ai_title = _scan_jsonl_summary(jsonl)
+    row = (stat.st_mtime_ns, stat.st_size, first_prompt, ai_title)
+    with _title_lock:
+        _title_cache[str(jsonl)] = row
+    fresh.append((str(jsonl), *row))
+    return first_prompt, ai_title
 
 
 def _load_session_index(project_dir: Path) -> dict[str, dict]:
@@ -862,8 +947,12 @@ def _scan_jsonl_summary(jsonl: Path) -> tuple[str, str]:
     first_prompt = ""
     ai_title = ""
     try:
-        with open(jsonl) as f:
+        with open(jsonl, "rb") as f:
             for line in f:
+                # Byte prefilter: sessions without an ai-title are read to the end,
+                # so only lines that can matter are decoded and parsed.
+                if not (b"ai-title" in line and not ai_title) and not (b'"user"' in line and not first_prompt):
+                    continue
                 try:
                     msg = json.loads(line)
                 except (json.JSONDecodeError, UnicodeError) as exc:

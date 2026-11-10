@@ -98,3 +98,68 @@ def test_python_fallback_matches_ripgrep(tmp_path):
         assert search.search_claude_session_ids("warp") == {"aaaa-1111"}
         assert len(search.search_codex_rollout_paths("한글")) == 1
     importlib.reload(search)
+
+
+def test_subagent_hit_maps_to_parent_session(tmp_path):
+    projects_dir, codex_dir = _setup(tmp_path)
+    sub = projects_dir / "-home-bch-test" / "bbbb-2222" / "subagents"
+    sub.mkdir(parents=True)
+    (sub / "agent-x.jsonl").write_text('{"type":"assistant","message":{"content":"needle only here"}}\n')
+    with patch.object(models, "PROJECTS_DIR", projects_dir), \
+         patch.object(models, "CODEX_SESSIONS_DIR", codex_dir):
+        importlib.reload(search)
+        assert search.search_claude_session_ids("needle") == {"bbbb-2222"}
+    importlib.reload(search)
+
+
+def test_cancelled_scan_stops_and_kills_ripgrep(tmp_path):
+    projects_dir, codex_dir = _setup(tmp_path)
+    for i in range(50):
+        (projects_dir / "-home-bch-test" / f"s{i}.jsonl").write_text('{"x":"hit"}\n')
+    with patch.object(models, "PROJECTS_DIR", projects_dir), \
+         patch.object(models, "CODEX_SESSIONS_DIR", codex_dir):
+        importlib.reload(search)
+        got = []
+        for sid in search.iter_claude_session_ids("hit", cancelled=lambda: len(got) >= 3):
+            got.append(sid)
+        assert len(got) == 3
+    importlib.reload(search)
+
+
+def test_unregistered_project_dir_is_listed_and_not_orphaned(monkeypatch, tmp_path):
+    from asm.services import claude_data
+    from tests.test_feature_smoke import _setup_fake_claude
+
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    moved_to = Path(env["home"]) / "work" / "new-home"
+    moved_to.mkdir(parents=True)
+    d = Path(env["projects_dir"]) / claude_data.encode_path(str(moved_to))
+    d.mkdir()
+    (d / "s9.jsonl").write_text(
+        '{"type":"user","cwd":"%s","message":{"content":"moved session"}}\n' % moved_to
+    )
+
+    assert str(moved_to) in {p.path for p in claude_data.get_projects()}
+    assert [s.summary for s in claude_data.get_project_sessions(str(moved_to))] == ["moved session"]
+    orphaned = {s.dir_name for s in claude_data.get_sessions() if s.is_orphaned}
+    assert d.name not in orphaned
+
+
+def test_session_titles_are_reused_until_the_file_changes(monkeypatch, tmp_path):
+    from asm.services import claude_data
+    from tests.test_feature_smoke import _setup_fake_claude
+
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    monkeypatch.setattr(claude_data, "_title_cache", None)
+    calls = []
+    real = claude_data._scan_jsonl_summary
+    monkeypatch.setattr(claude_data, "_scan_jsonl_summary", lambda f: calls.append(f) or real(f))
+
+    claude_data.get_project_sessions(env["project_b"])
+    monkeypatch.setattr(claude_data, "_title_cache", None)  # as in a fresh process: reload from the ledger
+    claude_data.get_project_sessions(env["project_b"])
+    assert len(calls) == 1
+
+    jsonl = Path(env["projects_dir"]) / env["encoded_b"] / f"{env['other_session_id']}.jsonl"
+    jsonl.write_text('{"type":"user","message":{"content":"edited prompt here"}}\n')
+    assert claude_data.get_project_sessions(env["project_b"])[0].summary == "edited prompt here"

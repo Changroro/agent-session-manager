@@ -52,7 +52,7 @@ class CCTuiApp(App):
         Binding("f2", "tab('tab-projects')", "Projects"),
         Binding("f3", "tab('tab-file-history')", "File History"),
         Binding("f4", "tab('tab-debug-todos')", "Debug/Todos"),
-        Binding("f5", "tab('tab-migrate')", "Migrate"),
+        Binding("f5", "tab('tab-migrate')", "Move/Copy"),
         Binding("f6", "tab('tab-backups')", "Backups"),
         Binding("f7", "tab('tab-artifacts')", "Artifacts"),
         Binding("f8", "tab('tab-agent-import')", "Claude↔Codex"),
@@ -70,6 +70,10 @@ class CCTuiApp(App):
         # Set by ProjectsPane's resume action just before exit; __main__ then
         # execs the resume command in the session's project dir.
         self.resume_target: tuple[str, str, str | None] | None = None
+        # Panes load when their tab is first shown, so the visible tab doesn't
+        # compete (GIL) with seven hidden ones at startup.
+        self.lazy_tabs = True
+        self._loaded_panes: set[int] = set()
 
     @property
     def target_encoded(self) -> str | None:
@@ -110,9 +114,13 @@ class CCTuiApp(App):
         tabs.active = tab_id
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        """Focus the dashboard pane when its tab opens so its shortcuts work."""
+        """Load a pane on its first view; focus the dashboard so its shortcuts work."""
         if event.tabbed_content.id != "main-tabs":
             return
+        for pane in event.pane.children:
+            if hasattr(pane, "refresh_data") and id(pane) not in self._loaded_panes:
+                self._loaded_panes.add(id(pane))
+                pane.refresh_data()
         if event.tab.id == "tab-dashboard":
             self.call_after_refresh(self._focus_dashboard)
 
@@ -168,6 +176,6 @@ class CCTuiApp(App):
             "DashboardPane, ProjectsPane, FileHistoryPane, "
             "DebugTodosPane, MigratePane, BackupsPane, ArtifactsPane"
         ):
-            if hasattr(pane, "refresh_data"):
+            if hasattr(pane, "refresh_data") and id(pane) in self._loaded_panes:
                 pane.refresh_data()
         self.notify(t("app.refreshed"))

@@ -22,17 +22,33 @@ def _run(monkeypatch, capsys, *argv: str) -> tuple[int, str]:
     return code, capsys.readouterr().out
 
 
-def test_cli_sessions_search(monkeypatch, capsys, tmp_path: Path):
-    env = _setup_fake_claude(monkeypatch, tmp_path)
-    code, out = _run(monkeypatch, capsys, "sessions", "--search", "alpha")
+def _find(monkeypatch, capsys, *argv) -> dict[str, str]:
+    code, out = _run(monkeypatch, capsys, "find", *argv, "--json")
     assert code == 0
-    assert env["session_id"] in out
-    assert env["other_session_id"] not in out
+    return {r["session_id"]: r["match"] for r in json.loads(out)}
 
 
-def test_cli_sessions_json(monkeypatch, capsys, tmp_path: Path):
+def test_cli_find_title_and_content_scopes(monkeypatch, capsys, tmp_path: Path):
     env = _setup_fake_claude(monkeypatch, tmp_path)
-    code, out = _run(monkeypatch, capsys, "sessions", "--json")
+    sid = env["session_id"]  # title "alpha prompt", body also has "alpha answer"
+    assert _find(monkeypatch, capsys, "alpha") == {sid: "title"}
+    assert _find(monkeypatch, capsys, "alpha answer") == {sid: "content"}  # body only
+    assert _find(monkeypatch, capsys, "alpha answer", "--only-title") == {}
+    assert _find(monkeypatch, capsys, "alpha prompt", "--only-content") == {sid: "content"}
+    assert _find(monkeypatch, capsys, "beta") == {env["other_session_id"]: "title"}
+
+
+def test_cli_find_marks_subagent_only_hits(monkeypatch, capsys, tmp_path: Path):
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    sub = Path(env["projects_dir"]) / env["encoded_b"] / env["other_session_id"] / "subagents"
+    sub.mkdir(parents=True)
+    (sub / "agent-1.jsonl").write_text('{"type":"assistant","message":{"content":"zebra"}}\n')
+    assert _find(monkeypatch, capsys, "zebra") == {env["other_session_id"]: "sub-agent"}
+
+
+def test_cli_find_without_query_lists_all(monkeypatch, capsys, tmp_path: Path):
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    code, out = _run(monkeypatch, capsys, "find", "--json")
     assert code == 0
     rows = json.loads(out)
     ids = {r["session_id"] for r in rows}
@@ -96,16 +112,105 @@ def test_cli_backup_create_and_list(monkeypatch, capsys, tmp_path: Path):
     assert created in out
 
 
-def test_cli_migrate(monkeypatch, capsys, tmp_path: Path):
+def test_cli_move_selected_session_by_id_prefix(monkeypatch, capsys, tmp_path: Path):
     env = _setup_fake_claude(monkeypatch, tmp_path)
     target = str(Path(env["home"]) / "work" / "project-gamma")
     code, out = _run(
         monkeypatch, capsys,
-        "migrate", env["project_a"], target,
-        "--sessions", env["session_id"], "--yes",
+        "move", env["project_a"], target + "/", "--sessions", env["session_id"][:8], "--yes",
     )
+    assert code == 0, out
+    assert "1 sessions moved" in out
+    projects = Path(env["projects_dir"])
+    assert not (projects / env["encoded_a"] / f"{env['session_id']}.jsonl").exists()
+    assert (projects / claude_data_encode(target) / f"{env['session_id']}.jsonl").exists()
+
+
+def claude_data_encode(path: str) -> str:
+    from asm.models import encode_path
+
+    return encode_path(path)
+
+
+def test_cli_move_all_claude_and_codex_sessions_of_a_project(monkeypatch, capsys, tmp_path: Path):
+    from asm.services import codex_data
+    from tests.test_codex_data import _write_rollout_real_layout
+
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    sessions = tmp_path / "codex" / "sessions"
+    rollout = sessions / "2026" / "06" / "01" / "rollout-2026-06-01T09-00-00-cccc.jsonl"
+    _write_rollout_real_layout(rollout, "cccc", env["project_a"], ["gpt-5.5"], None)
+    monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", sessions)
+    codex_data.refresh()
+    target = str(Path(env["home"]) / "work" / "project-gamma")
+
+    code, out = _run(monkeypatch, capsys, "move", env["project_a"], target, "--yes", "--json")
+
+    assert code == 0, out
+    result = json.loads(out)
+    assert result["claude"]["moved"] == 1 and result["codex"] == {"moved": 1, "failed": [], "ids": {"cccc": "cccc"}}
+    codex_data.refresh()
+    assert [s.session_id for s in codex_data.get_project_sessions(target)] == ["cccc"]
+
+
+def test_cli_copy_keeps_original_and_reports_new_id(monkeypatch, capsys, tmp_path: Path):
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    target = str(Path(env["home"]) / "work" / "project-gamma")
+    code, out = _run(
+        monkeypatch, capsys, "copy", env["project_a"], target, "--sessions", env["session_id"][:8], "--yes", "--json",
+    )
+    assert code == 0, out
+    new_id = json.loads(out)["claude"]["ids"][env["session_id"]]
+    projects = Path(env["projects_dir"])
+    assert (projects / env["encoded_a"] / f"{env['session_id']}.jsonl").exists()
+    assert (projects / claude_data_encode(target) / f"{new_id}.jsonl").exists()
+
+
+def test_cli_move_refuses_session_not_in_source(monkeypatch, capsys, tmp_path: Path):
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    code, _ = _run(
+        monkeypatch, capsys,
+        "move", env["project_a"], "/elsewhere", "--sessions", env["other_session_id"], "--yes",
+    )
+    assert code == 1
+    assert (Path(env["projects_dir"]) / env["encoded_b"] / f"{env['other_session_id']}.jsonl").exists()
+
+
+def test_cli_id_prefix_resolves_or_reports_ambiguity(monkeypatch, capsys, tmp_path: Path):
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    code, out = _run(monkeypatch, capsys, "preview", env["session_id"][:8], "--json")
+    assert code == 0 and json.loads(out)
+
+    proj = Path(env["projects_dir"]) / env["encoded_b"]
+    for sid in ("abcd1234-0000-0000-0000-000000000000", "abcd5678-0000-0000-0000-000000000000"):
+        (proj / f"{sid}.jsonl").write_text('{"type":"user","message":{"content":"x"}}\n')
+    code, _ = _run(monkeypatch, capsys, "preview", "abcd")
+    assert code == 1
+    import pytest
+
+    from asm.cli import AmbiguousSessionError, _resolve_session_id
+
+    with pytest.raises(AmbiguousSessionError, match="matches several sessions"):
+        _resolve_session_id("abcd")
+    assert _resolve_session_id("abcd1") == "abcd1234-0000-0000-0000-000000000000"
+
+
+def test_cli_resume_disambiguates_duplicate_with_project(monkeypatch, capsys, tmp_path: Path):
+    import shutil
+
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    projects = Path(env["projects_dir"])
+    name = f"{env['session_id']}.jsonl"
+    shutil.copy(projects / env["encoded_a"] / name, projects / env["encoded_b"] / name)
+    Path(env["project_b"]).mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)  # resume chdirs into the project; restore afterwards
+    monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+
+    code, _ = _run(monkeypatch, capsys, "resume", env["session_id"], "--dry-run")
+    assert code != 0  # ambiguous without --project
+    code, _ = _run(monkeypatch, capsys, "resume", env["session_id"], "--project", env["project_b"], "--dry-run")
     assert code == 0
-    assert "1 session(s) copied" in out
+    assert Path.cwd() == Path(env["project_b"])
 
 
 def test_cli_destructive_requires_confirmation(monkeypatch, capsys, tmp_path: Path):

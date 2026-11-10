@@ -20,6 +20,7 @@ import hashlib
 import logging
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -40,6 +41,8 @@ CREATE TABLE IF NOT EXISTS codex_sessions(
     started TEXT, mtime REAL, size INTEGER,
     input INTEGER, cached_input INTEGER, output INTEGER, cost REAL,
     first_prompt TEXT, git_branch TEXT);
+CREATE TABLE IF NOT EXISTS claude_titles(
+    path TEXT PRIMARY KEY, mtime_ns INTEGER, size INTEGER, first_prompt TEXT, ai_title TEXT);
 """
 
 _PROGRESS_EVERY = 200
@@ -57,7 +60,8 @@ def _connect() -> sqlite3.Connection:
     path.parent.chmod(0o700)
     if os.name != "nt" and path.parent.stat().st_mode & 0o777 != 0o700:
         raise OSError(f"Could not restrict ledger directory: {path.parent}")
-    conn = sqlite3.connect(str(path))
+    # Generous timeout: a one-time backfill in another asm process can hold the write lock.
+    conn = sqlite3.connect(str(path), timeout=60)
     conn.executescript(_SCHEMA)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(scanned_files)")}
     if "fingerprint" not in columns:
@@ -86,13 +90,19 @@ def _fingerprint(path: Path) -> str:
 
 
 def _changed(known: dict, path: Path) -> tuple[float, int, str] | None:
-    """Return the current file identity when it is new or changed."""
+    """Return the current file identity when it is new or changed.
+
+    Unchanged (mtime, size) means unchanged: hashing every file on every refresh
+    re-read the whole ~/.claude + ~/.codex tree (many GB) each time asm opened.
+    """
     try:
         st = path.stat()
+        prev = known.get(str(path))
+        if prev is not None and prev[0] == st.st_mtime and prev[1] == st.st_size:
+            return None
         fingerprint = _fingerprint(path)
     except OSError as exc:
         raise OSError(f"cannot fingerprint {path}: {exc}") from exc
-    prev = known.get(str(path))
     stamp = (st.st_mtime, st.st_size, fingerprint)
     return None if prev == stamp else stamp
 
@@ -107,8 +117,18 @@ def _load_rates_if_needed(new_count: int) -> None:
 # ── Claude ───────────────────────────────────────────────────────────────
 
 
+# Tabs load in parallel worker threads; one updater at a time avoids duplicate
+# scans and "database is locked" (the next caller then finds nothing new).
+_update_lock = threading.Lock()
+
+
 def update_claude(progress: ProgressCB | None = None) -> int:
     """Parse new/changed Claude session files into the ledger. Returns count."""
+    with _update_lock:
+        return _update_claude(progress)
+
+
+def _update_claude(progress: ProgressCB | None) -> int:
     from asm.services import claude_data
 
     root = claude_data.PROJECTS_DIR
@@ -139,7 +159,7 @@ def update_claude(progress: ProgressCB | None = None) -> int:
 def _ingest_claude_file(
     conn: sqlite3.Connection, jsonl: Path, project_dir: str, stamp: tuple[float, int, str]
 ) -> None:
-    from asm.services.pricing import calc_cost, is_billable
+    from asm.services.pricing import PricingDataError, calc_cost, is_billable
 
     rows = []
     with open(jsonl, encoding="utf-8") as f:
@@ -172,13 +192,17 @@ def _ingest_claude_file(
                 raise ValueError(f"unexpected Claude token usage: {jsonl}")
             if not any(token_values):
                 continue
+            try:
+                cost = calc_cost(usage, model)
+            except PricingDataError:
+                cost = 0.0  # non-Anthropic model behind a proxy (e.g. GLM): tokens kept, no Claude price
             rows.append((
                 msg_id, ts_str, model,
                 usage.get("input_tokens", 0),
                 usage.get("output_tokens", 0),
                 usage.get("cache_read_input_tokens", 0),
                 usage.get("cache_creation_input_tokens", 0),
-                calc_cost(usage, model),
+                cost,
                 project_dir, str(jsonl),
             ))
     frozen = {
@@ -223,11 +247,37 @@ def claude_records() -> dict[str, dict]:
         conn.close()
 
 
+def claude_titles() -> dict[str, tuple[int, int, str, str]]:
+    """{jsonl path: (mtime_ns, size, first_prompt, ai_title)} cached session titles."""
+    conn = _connect()
+    try:
+        return {
+            row[0]: (row[1], row[2], row[3], row[4])
+            for row in conn.execute("SELECT path, mtime_ns, size, first_prompt, ai_title FROM claude_titles")
+        }
+    finally:
+        conn.close()
+
+
+def store_claude_titles(rows: list[tuple[str, int, int, str, str]]) -> None:
+    conn = _connect()
+    try:
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO claude_titles VALUES (?,?,?,?,?)", rows)
+    finally:
+        conn.close()
+
+
 # ── Codex ────────────────────────────────────────────────────────────────
 
 
 def update_codex(progress: ProgressCB | None = None) -> int:
     """Parse new/changed Codex rollouts into the ledger. Returns count."""
+    with _update_lock:
+        return _update_codex(progress)
+
+
+def _update_codex(progress: ProgressCB | None) -> int:
     from asm.services import codex_data
 
     if not codex_data.CODEX_SESSIONS_DIR.exists():
