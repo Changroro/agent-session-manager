@@ -54,6 +54,8 @@ def _setup_fake_claude(monkeypatch, tmp_path: Path) -> dict[str, Path | str]:
 
     backups_dir = home / ".cc-tui" / "backups"
     backups_dir.mkdir(parents=True)
+    app_data_dir = home / ".asm"
+    app_data_dir.mkdir()
 
     project_a = str(home / "work" / "project-alpha")
     project_b = str(home / "work" / "project-beta")
@@ -166,6 +168,8 @@ def _setup_fake_claude(monkeypatch, tmp_path: Path) -> dict[str, Path | str]:
     monkeypatch.setattr(models, "PLUGINS_DIR", plugins_dir)
     monkeypatch.setattr(models, "SKILLS_DIR", skills_dir)
     monkeypatch.setattr(models, "BACKUP_BASE_DIR", backups_dir)
+    monkeypatch.setattr(models, "APP_DATA_DIR", app_data_dir)
+    monkeypatch.setattr(models, "RECOVERY_BASE_DIR", app_data_dir / "recovery")
 
     monkeypatch.setattr(claude_data, "CLAUDE_DIR", claude_dir)
     monkeypatch.setattr(claude_data, "CLAUDE_JSON", claude_json)
@@ -184,9 +188,25 @@ def _setup_fake_claude(monkeypatch, tmp_path: Path) -> dict[str, Path | str]:
     # Keep Claude-only tests isolated from any real ~/.codex on this machine,
     # and drop usage caches primed by earlier tests against other tmp dirs.
     from asm.services import codex_data
+    from asm.services import artifacts as artifacts_service, search as search_service
+    from asm.services import agent_import as agent_import_service
+    from asm.screens import backups as backups_screen
     codex_data.refresh()
     claude_data.refresh_usage_cache()
     monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", claude_dir / "no-codex")
+    isolated_codex = claude_dir / "no-codex-home"
+    monkeypatch.setattr(backup_service, "CODEX_DIR", isolated_codex)
+    monkeypatch.setattr(backup_service, "CODEX_SESSIONS_DIR", isolated_codex / "sessions")
+    monkeypatch.setattr(backups_screen, "CODEX_DIR", isolated_codex)
+    monkeypatch.setattr(backups_screen, "CODEX_SESSIONS_DIR", isolated_codex / "sessions")
+    monkeypatch.setattr(agent_import_service, "CODEX_CONFIG", isolated_codex / "config.toml")
+    monkeypatch.setattr(agent_import_service, "CODEX_SESSIONS_DIR", isolated_codex / "sessions")
+    monkeypatch.setattr(agent_import_service, "CODEX_IMPORT_RECORDS", isolated_codex / "imports.json")
+    monkeypatch.setattr(agent_import_service, "CLAUDE_JSON", claude_json)
+    monkeypatch.setattr(agent_import_service, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(artifacts_service, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(search_service, "PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(search_service, "CODEX_SESSIONS_DIR", claude_dir / "no-codex")
     monkeypatch.setattr(cleaner, "SESSION_ENV_DIR", session_env_dir)
     monkeypatch.setattr(cleaner, "FILE_HISTORY_DIR", file_history_dir)
     monkeypatch.setattr(cleaner, "DEBUG_DIR", debug_dir)
@@ -207,7 +227,6 @@ def _setup_fake_claude(monkeypatch, tmp_path: Path) -> dict[str, Path | str]:
     monkeypatch.setattr(projects_screen, "PROJECTS_DIR", projects_dir)
     monkeypatch.setattr(debug_todos_screen, "DEBUG_DIR", debug_dir)
     monkeypatch.setattr(migrate_screen, "PROJECTS_DIR", projects_dir)
-    monkeypatch.setattr(migrate, "send2trash", _fake_send2trash)
     monkeypatch.setattr(cleaner, "send2trash", _fake_send2trash)
     monkeypatch.setattr(backup_service, "send2trash", _fake_send2trash)
 
@@ -379,5 +398,94 @@ def test_projects_filter_by_session_title(monkeypatch, tmp_path: Path):
             assert env["project_a"] in project_paths
             assert env["project_b"] not in project_paths
             assert env["session_id"] in session_ids
+
+    asyncio.run(run_app())
+
+
+def test_projects_filter_streams_body_hits_including_unregistered_dirs(monkeypatch, tmp_path: Path):
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    moved_to = Path(env["home"]) / "work" / "moved-here"
+    moved_to.mkdir(parents=True)
+    d = Path(env["projects_dir"]) / claude_data.encode_path(str(moved_to))
+    d.mkdir()
+    _write_jsonl(d / "33333333-3333-3333-3333-333333333333.jsonl", [
+        {"type": "user", "cwd": str(moved_to), "message": {"content": "unrelated title"}},
+        {"type": "assistant", "message": {"content": "zebra crossing deep in the body"}},
+    ])
+
+    async def run_app() -> None:
+        from textual.widgets import Tree
+
+        app = CCTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_tab("tab-projects")
+            pane = app.query_one(projects_screen.ProjectsPane)
+            for _ in range(100):
+                if pane._session_cache is not None:  # title index is built eagerly
+                    break
+                await pilot.pause(0.05)
+            assert pane._session_cache is not None
+
+            app.query_one("#projects-filter").value = "zebra crossing"
+            for _ in range(100):
+                if pane._session_match_map:
+                    break
+                await pilot.pause(0.05)
+
+            sessions = []
+            stack = list(app.query_one("#project-tree", Tree).root.children)
+            while stack:
+                n = stack.pop()
+                stack.extend(n.children)
+                if n.data and n.data[0] == "session":
+                    sessions.append(n.data[1])
+            assert sessions == ["33333333-3333-3333-3333-333333333333"]
+
+    asyncio.run(run_app())
+
+
+def test_projects_filter_marks_subagent_only_hits(monkeypatch, tmp_path: Path):
+    env = _setup_fake_claude(monkeypatch, tmp_path)
+    sub = Path(env["projects_dir"]) / env["encoded_b"] / env["other_session_id"] / "subagents"
+    sub.mkdir(parents=True)
+    (sub / "agent-1.jsonl").write_text('{"type":"assistant","message":{"content":"zebra crossing"}}\n')
+
+    async def run_app() -> None:
+        from textual.widgets import Tree
+
+        app = CCTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_tab("tab-projects")
+            pane = app.query_one(projects_screen.ProjectsPane)
+            for _ in range(100):
+                if pane._session_cache is not None:
+                    break
+                await pilot.pause(0.05)
+            app.query_one("#projects-filter").value = "zebra crossing"
+            for _ in range(100):
+                if pane._session_match_map:
+                    break
+                await pilot.pause(0.05)
+            labels = []
+            stack = list(app.query_one("#project-tree", Tree).root.children)
+            while stack:
+                n = stack.pop()
+                stack.extend(n.children)
+                if n.data and n.data[0] == "session":
+                    labels.append((n.data[1], str(n.label)))
+            assert [sid for sid, _ in labels] == [env["other_session_id"]]
+            assert "(sub-agent)" in labels[0][1]
+
+            # A hit in the session's own transcript carries no marker.
+            app.query_one("#projects-filter").value = "beta prompt"
+            await pilot.pause(0.6)
+            stack = list(app.query_one("#project-tree", Tree).root.children)
+            while stack:
+                n = stack.pop()
+                stack.extend(n.children)
+                if n.data and n.data[0] == "session":
+                    assert "(sub-agent)" not in str(n.label)
 
     asyncio.run(run_app())

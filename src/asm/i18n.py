@@ -14,7 +14,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "tab.projects": {"en": "Projects", "ko": "프로젝트"},
     "tab.file_history": {"en": "File History", "ko": "파일 히스토리"},
     "tab.debug_todos": {"en": "Debug/Todos", "ko": "디버그/Todos"},
-    "tab.migrate": {"en": "Migrate", "ko": "마이그레이션"},
+    "tab.migrate": {"en": "Move/Copy", "ko": "이동/복사"},
     "tab.backups": {"en": "Backups", "ko": "백업"},
     "tab.artifacts": {"en": "Artifacts", "ko": "아티팩트"},
     "tab.agent_import": {"en": "Claude ↔ Codex", "ko": "Claude ↔ Codex"},
@@ -23,15 +23,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ko": "Claude Code와 Codex에서 옮길 수 있는 세션·MCP 서버를 스캔 중...",
     },
     "imp.header": {
-        "en": "{mode}  ·  {pending} movable, {selected} selected  ·  1-4: direction  ·  space: pick  ·  a: all/none  ·  i: move",
-        "ko": "{mode}  ·  옮길 수 있음 {pending}개, 선택 {selected}개  ·  1-4: 방향  ·  space: 선택  ·  a: 전체/해제  ·  i: 옮기기",
+        "en": "{mode}  ·  {pending} copyable, {selected} selected  ·  1-4: direction  ·  space: pick  ·  a: all/none  ·  i: copy",
+        "ko": "{mode}  ·  복사 가능 {pending}개, 선택 {selected}개  ·  1-4: 방향  ·  space: 선택  ·  a: 전체/해제  ·  i: 복사",
     },
-    "imp.new": {"en": "movable", "ko": "옮기기 가능"},
+    "imp.new": {"en": "copyable", "ko": "복사 가능"},
     "imp.skip": {"en": "skipped", "ko": "건너뜀"},
     "imp.nothing": {"en": "Nothing selected to import.", "ko": "가져올 항목이 선택되지 않았습니다."},
     "imp.confirm": {
-        "en": "Import {count} item(s) via {mode}? A backup snapshot is taken first.",
-        "ko": "{mode}(으)로 {count}개를 가져올까요? 먼저 백업 스냅샷을 만듭니다.",
+        "en": "Copy {count} item(s) via {mode}? The source stays in place; a backup snapshot is taken first.",
+        "ko": "{mode}(으)로 {count}개를 복사할까요? 원본은 유지되며 먼저 백업 스냅샷을 만듭니다.",
     },
     "imp.done": {
         "en": "Imported {imported}, failed {failed}",
@@ -159,6 +159,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ko": "새 작업 디렉토리 (세션의 cwd를 재작성):",
     },
     "proj.move_codex_ok": {"en": "Session moved (cwd updated)", "ko": "세션 이동됨 (cwd 갱신)"},
+    "proj.btn_copy_codex": {"en": "Copy", "ko": "복사"},
+    "proj.copy_codex_title": {"en": "Copy Codex session", "ko": "Codex 세션 복사"},
+    "proj.copy_codex_label": {
+        "en": "Working directory for the copy (gets a new session id):",
+        "ko": "복사본의 작업 디렉토리 (새 세션 id로 생성):",
+    },
+    "proj.copy_codex_ok": {"en": "Session copied as {sid}", "ko": "세션 복사됨: {sid}"},
     "proj.duplicates_title": {"en": "Duplicate Sessions", "ko": "중복 세션"},
     "proj.copies": {"en": "copies", "ko": "곳"},
     "proj.duplicate_session": {"en": "Duplicate session", "ko": "중복 세션"},
@@ -278,7 +285,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Delete all empty todo files?\n\n{count} empty files found.\n[dim]Moved to trash, recoverable[/]",
         "ko": "빈 Todo 파일을 모두 삭제하시겠습니까?\n\n{count}개의 빈 파일.\n[dim]휴지통으로 이동, 복구 가능[/]",
     },
-    "dt.prune_ok": {"en": "Pruned {ok} empty files", "ko": "빈 파일 {ok}개 정리 완료"},
+    "dt.prune_ok": {"en": "Pruned {ok} empty files ({fail} failed)", "ko": "빈 파일 {ok}개 정리 완료 ({fail}개 실패)"},
     "dt.btn_trash_orphaned_debug": {"en": "Trash Orphaned ({count})", "ko": "Orphaned 삭제 ({count})"},
     "dt.btn_trash_orphaned_todo": {"en": "Trash Orphaned ({count})", "ko": "Orphaned 삭제 ({count})"},
     "dt.confirm_trash_orphaned_debug": {
@@ -292,32 +299,36 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     # ── Migrate ──
     "mig.info": {
         "en": (
-            "[bold]Migrate[/] - Session migration (copy-based, keeps originals)\n"
-            "[dim]Select source project on the left, target on the right.\n"
-            "Session files and memory are copied from source to target.[/]"
+            "[bold]Move / Copy[/] - Sessions to another project\n"
+            "[dim]Select source project on the left, target on the right, pick sessions, then Move or Copy.\n"
+            "Move keeps the session id and sends originals to trash (recovery snapshot). Copy keeps originals and gives copies new ids. Subagent/tool-result folders go along; memory is merged.[/]"
         ),
         "ko": (
-            "[bold]Migrate[/] - 세션 마이그레이션 (복사 기반, 원본 유지)\n"
-            "[dim]왼쪽에서 소스 프로젝트, 오른쪽에서 대상 프로젝트를 선택하세요.\n"
-            "세션 파일과 메모리가 소스에서 대상으로 복사됩니다.[/]"
+            "[bold]이동 / 복사[/] - 세션을 다른 프로젝트로\n"
+            "[dim]왼쪽에서 원본 프로젝트, 오른쪽에서 대상 폴더를 고르고 세션을 선택한 뒤 Move 또는 Copy를 누르세요.\n"
+            "Move는 세션 id를 유지하고 원본을 휴지통으로 보냅니다(복구 스냅샷). Copy는 원본을 두고 새 id로 복제합니다. 서브에이전트·도구 결과 폴더도 함께 가고, 메모리는 합쳐집니다.[/]"
         ),
     },
     "mig.source_title": {
-        "en": "[bold cyan]Source[/] (original to copy) [dim]- only projects with sessions[/]",
-        "ko": "[bold cyan]Source[/] (복사할 원본) [dim]- 세션이 있는 프로젝트만 표시[/]",
+        "en": "[bold cyan]Source[/] [dim]- only projects with sessions[/]",
+        "ko": "[bold cyan]Source[/] (원본) [dim]- 세션이 있는 프로젝트만 표시[/]",
     },
-    "mig.target_title": {"en": "[bold green]Target[/] (destination)", "ko": "[bold green]Target[/] (복사할 대상)"},
+    "mig.target_title": {"en": "[bold green]Target[/] (destination)", "ko": "[bold green]Target[/] (대상)"},
     "mig.not_selected": {"en": "[dim]Not selected[/]", "ko": "[dim]선택되지 않음[/]"},
     "mig.select_source": {"en": "Select source project on the left", "ko": "왼쪽에서 소스 프로젝트를 선택하세요"},
     "mig.select_target": {"en": "Select target project on the right", "ko": "오른쪽에서 대상 프로젝트를 선택하세요"},
     "mig.same_error": {"en": "Source and target are the same", "ko": "소스와 대상이 같습니다"},
     "mig.no_sessions_selected": {"en": "No sessions selected", "ko": "선택된 세션이 없습니다"},
     "mig.confirm": {
-        "en": "Migrate sessions?\n\nSource: {src}\nTarget: {tgt}\nMode: {mode}\n\n[dim]Session files will be copied. Originals are kept.[/]",
-        "ko": "Migrate sessions?\n\nSource: {src}\nTarget: {tgt}\nMode: {mode}\n\n[dim]세션 파일이 복사됩니다. 원본은 유지됩니다.[/]",
+        "en": "Move sessions?\n\nSource: {src}\nTarget: {tgt}\nMode: {mode}\n\n[dim]Same session ids. Originals go to trash (recoverable).[/]",
+        "ko": "세션을 이동할까요?\n\n원본: {src}\n대상: {tgt}\n모드: {mode}\n\n[dim]세션 id는 그대로입니다. 원본은 휴지통으로 갑니다(복구 가능).[/]",
     },
-    "mig.complete": {"en": "Migration complete!", "ko": "마이그레이션 완료!"},
-    "mig.failed": {"en": "Migration failed", "ko": "마이그레이션 실패"},
+    "mig.confirm_copy": {
+        "en": "Copy sessions?\n\nSource: {src}\nTarget: {tgt}\n\n[dim]Copies get new session ids. Originals stay.[/]",
+        "ko": "세션을 복사할까요?\n\n원본: {src}\n대상: {tgt}\n\n[dim]복사본은 새 세션 id를 받습니다. 원본은 그대로 둡니다.[/]",
+    },
+    "mig.complete": {"en": "Done!", "ko": "완료!"},
+    "mig.failed": {"en": "Failed", "ko": "실패"},
     # ── Backups ──
     "bak.info": {
         "en": (
@@ -452,15 +463,10 @@ def t(key: str, **kwargs) -> str:
     """Get translated string. Supports {placeholder} formatting."""
     entry = TRANSLATIONS.get(key)
     if not entry:
-        return key
-    text = entry.get(_current_lang, entry.get("en", key))
-    if kwargs:
-        try:
-            text = text.format(**kwargs)
-        except (KeyError, IndexError, ValueError):
-            # Missing/typo'd placeholder shouldn't crash the UI — return raw text.
-            pass
-    return text
+        raise KeyError(f"Unknown translation key: {key}")
+    if _current_lang not in entry:
+        raise KeyError(f"Missing {_current_lang} translation: {key}")
+    return entry[_current_lang].format(**kwargs)
 
 
 def init_lang(cli_lang: str | None = None) -> None:

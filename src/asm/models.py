@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,50 +59,13 @@ LEGACY_APP_DATA_DIRS = [Path.home() / ".agentkeep", Path.home() / ".cc-tui"]
 
 # --- Codex (OpenAI Codex CLI) data layout ---
 # Sessions are global rollout-*.jsonl files partitioned by date, not per-project.
-# CODEX_HOME is Codex's own way of selecting a home, so people running more than
-# one account (separate homes per login) can point asm at either.
+# Codex App, CLI and companion agents share one data home. CODEX_HOME may
+# point one process at a legacy/archive home, but asm never auto-discovers or
+# aggregates sibling ~/.codex-* directories.
 DEFAULT_CODEX_DIR = Path.home() / ".codex"
 CODEX_DIR = Path(os.environ["CODEX_HOME"]).expanduser() if os.environ.get("CODEX_HOME") else DEFAULT_CODEX_DIR
 CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
 
-
-def resolve_session_dirs(current: Path) -> list[Path]:
-    """Codex sessions/ dirs to scan for ``current``.
-
-    A caller that repointed its own constant (tests, a pinned home) keeps that
-    exact dir; otherwise every configured home is scanned.
-    """
-    if current != CODEX_DIR / "sessions":
-        return [current]
-    return [home / "sessions" for home in codex_homes() if (home / "sessions").is_dir()]
-
-
-_codex_home_override: list[Path] | None = None
-
-
-def set_codex_homes(paths: list[str] | None) -> None:
-    """Pin the Codex homes to scan (from --codex-home); None restores discovery."""
-    global _codex_home_override
-    _codex_home_override = [Path(p).expanduser() for p in paths] if paths else None
-
-
-def codex_homes() -> list[Path]:
-    """Every Codex home to scan, primary first.
-
-    Codex keeps one home per login, so a second account lives in its own dir.
-    Resolution order: --codex-home, then ASM_CODEX_HOMES (os.pathsep-separated),
-    then CODEX_HOME plus any sibling ~/.codex-* dir that holds a sessions/ tree.
-    """
-    if _codex_home_override:
-        return _codex_home_override
-    configured = os.environ.get("ASM_CODEX_HOMES")
-    if configured:
-        return [Path(p).expanduser() for p in configured.split(os.pathsep) if p]
-    homes = [CODEX_DIR]
-    for candidate in sorted(Path.home().glob(".codex-*")):
-        if candidate.is_dir() and (candidate / "sessions").is_dir() and candidate not in homes:
-            homes.append(candidate)
-    return homes
 
 
 def migrate_legacy_data_dir() -> bool:
@@ -112,24 +76,28 @@ def migrate_legacy_data_dir() -> bool:
     doesn't strand the old backups. Returns True if anything was migrated. Safe to
     call on every startup (no-op once the legacy dirs are gone).
     """
-    import shutil
-
     moved = False
+    failures: list[str] = []
     for legacy in LEGACY_APP_DATA_DIRS:
         if not legacy.exists():
             continue
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            for item in legacy.iterdir():
-                dest = APP_DATA_DIR / item.name
-                if dest.exists():
-                    continue  # don't overwrite newer data
+        for item in legacy.iterdir():
+            dest = APP_DATA_DIR / item.name
+            if dest.exists():
+                continue
+            try:
                 shutil.move(str(item), str(dest))
                 moved = True
+            except OSError as exc:
+                failures.append(f"{item}: {exc}")
+        try:
             if not any(legacy.iterdir()):
                 legacy.rmdir()
-        except OSError:
-            continue
+        except OSError as exc:
+            failures.append(f"{legacy}: {exc}")
+    if failures:
+        raise OSError("Legacy app-data migration failed: " + "; ".join(failures))
     return moved
 
 

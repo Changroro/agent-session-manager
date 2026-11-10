@@ -47,7 +47,8 @@ class ArtifactsPane(Container):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_columns("Published", "Title", "Project", "URL")
-        self.refresh_data()
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.refresh_data()
 
     def refresh_data(self) -> None:
         self.run_worker(self._load, thread=True)
@@ -89,14 +90,25 @@ class ArtifactsPane(Container):
             return
         import webbrowser
 
-        webbrowser.open(artifact.url)
+        try:
+            opened = webbrowser.open(artifact.url)
+        except OSError as exc:
+            self.app.notify(f"Open failed: {exc}", severity="error")
+            return
+        if not opened:
+            self.app.notify("Browser did not accept the artifact URL", severity="error")
+            return
         self.app.notify(t("art.opened", url=artifact.url))
 
     def action_copy_url(self) -> None:
         artifact = self._selected()
         if artifact is None:
             return
-        self.app.copy_to_clipboard(artifact.url)
+        try:
+            self.app.copy_to_clipboard(artifact.url)
+        except (OSError, RuntimeError) as exc:
+            self.app.notify(f"Copy failed: {exc}", severity="error")
+            return
         self.app.notify(t("art.copied", url=artifact.url))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:

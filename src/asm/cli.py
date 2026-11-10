@@ -19,6 +19,20 @@ from asm.utils import TOP_PROJECT_CHART_ROWS, format_bytes
 _TITLE_WIDTH = 60
 
 
+class AmbiguousSessionError(ValueError):
+    pass
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
 # ── helpers ─────────────────────────────────────────────────────────────
 
 
@@ -26,11 +40,19 @@ def _out_json(data) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
 
 
+def _result(args, payload: dict, message: str, *, error: bool = False) -> None:
+    if getattr(args, "json", False):
+        _out_json(payload)
+    else:
+        print(message, file=sys.stderr if error else sys.stdout)
+
+
 def _confirm(prompt: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
     try:
-        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+        print(f"{prompt} [y/N] ", end="", file=sys.stderr, flush=True)
+        return input().strip().lower() in ("y", "yes")
     except EOFError:
         return False
 
@@ -47,14 +69,26 @@ def _role(m: dict) -> str:
     return m.get("type") or m.get("role") or "?"
 
 
-def _find_claude_project_dir(session_id: str) -> str | None:
+def _find_claude_project_dir(session_id: str, project: str | None = None) -> str | None:
     """Encoded project dir name owning this session's JSONL, if any."""
-    from asm.models import PROJECTS_DIR
+    from asm.models import PROJECTS_DIR, encode_path
 
+    from asm.utils import validate_identifier
+
+    validate_identifier(session_id, "session id")
+    matches = []
     if PROJECTS_DIR.exists():
         for d in PROJECTS_DIR.iterdir():
             if d.is_dir() and (d / f"{session_id}.jsonl").exists():
-                return d.name
+                matches.append(d.name)
+    if project is not None:
+        matches = [name for name in matches if name == project or name == encode_path(project)]
+    if len(matches) > 1:
+        raise AmbiguousSessionError(
+            f"session id is present in multiple projects: {session_id} ({', '.join(sorted(matches))})"
+        )
+    if matches:
+        return matches[0]
     return None
 
 
@@ -81,7 +115,7 @@ def _src_cell(src: str):
     from rich.text import Text
 
     # Same source colors as the TUI (Claude orange / Codex teal).
-    return Text("C", style="#D97757") if src == "claude" else Text("X", style="#10A37F")
+    return Text("claude", style="#D97757") if src == "claude" else Text("codex", style="#10A37F")
 
 
 def _sources(source: str) -> list[str]:
@@ -90,7 +124,11 @@ def _sources(source: str) -> list[str]:
     srcs = []
     if source in ("all", "claude"):
         srcs.append("claude")
-    if source in ("all", "codex") and codex_data.is_available():
+    if source == "codex" and not codex_data.is_available():
+        raise RuntimeError("Codex source is unavailable")
+    if source == "all" and codex_data.is_available():
+        srcs.append("codex")
+    elif source == "codex":
         srcs.append("codex")
     return srcs
 
@@ -247,13 +285,85 @@ def cmd_projects(args) -> int:
     return 0
 
 
-def cmd_sessions(args) -> int:
+def _short_ids(ids) -> dict[str, str]:
+    """Shortest prefix (at least 8 chars) that is unique among ``ids``."""
+    ordered = sorted(set(ids))
+    out: dict[str, str] = {}
+    for i, sid in enumerate(ordered):
+        common = 0
+        for other in (ordered[i - 1] if i else "", ordered[i + 1] if i + 1 < len(ordered) else ""):
+            n = 0
+            while n < min(len(sid), len(other)) and sid[n] == other[n]:
+                n += 1
+            common = max(common, n)
+        out[sid] = sid[: max(8, common + 1)]
+    return out
+
+
+def _resolve_session_id(sid: str) -> str:
+    """Full Claude/Codex session id for a full id or a unique prefix of one."""
+    import glob
+
+    from asm.models import PROJECTS_DIR
+    from asm.services import codex_data
+    from asm.utils import validate_identifier
+
+    validate_identifier(sid, "session id")
+    if len(sid) >= 36:
+        return sid
+    found: set[str] = set()
+    if PROJECTS_DIR.exists():
+        for d in PROJECTS_DIR.iterdir():
+            if d.is_dir():
+                found.update(f.stem for f in d.glob(f"{glob.escape(sid)}*.jsonl"))
+    if codex_data.is_available():
+        for f in codex_data._rollout_files():
+            full = f.name[-42:-6]  # rollout-<timestamp>-<36-char id>.jsonl
+            if full.startswith(sid):
+                found.add(full)
+    if len(found) > 1:
+        raise AmbiguousSessionError(
+            f"id prefix {sid} matches several sessions: {', '.join(sorted(found)[:5])}"
+        )
+    return found.pop() if found else sid
+
+
+def cmd_find(args) -> int:
+    """List sessions, optionally matching a query in titles and/or conversation bodies."""
+    from asm.services import search
+
+    query = (args.query or "").strip()
     rows = _tagged_sessions(args.source, args.project)
-    if args.search:
-        q = args.search.casefold()
-        rows = [r for r in rows if q in (r[0].summary or "").casefold()]
+    short = _short_ids(s.session_id for s, _src, _path in rows)
+    matched: list[tuple] = []
+    if query:
+        nq = search.normalize(query)
+        main: set[str] = set()
+        sub: set[str] = set()
+        codex_paths: set[str] = set()
+        if not args.only_title:
+            srcs = _sources(args.source)
+            if "claude" in srcs:
+                for sid, via_sub in search.iter_claude_hits(query):
+                    (sub if via_sub else main).add(sid)
+            if "codex" in srcs:
+                codex_paths = set(search.iter_codex_rollout_paths(query))
+        for s, src, path in rows:
+            if not args.only_content and nq in search.normalize(s.summary or ""):
+                where = "title"
+            elif src == "claude" and s.session_id in main:
+                where = "content"
+            elif src == "claude" and s.session_id in sub:
+                where = "sub-agent"
+            elif src == "codex" and s.project_dir in codex_paths:
+                where = "content"
+            else:
+                continue
+            matched.append((s, src, path, where))
+    else:
+        matched = [(s, src, path, "") for s, src, path in rows]
     if args.limit:
-        rows = rows[: args.limit]
+        matched = matched[: args.limit]
 
     if args.json:
         _out_json([
@@ -262,44 +372,45 @@ def cmd_sessions(args) -> int:
                 "source": src,
                 "project": path,
                 "title": s.summary,
+                "match": where,
                 "modified": _fmt_ts(s.last_modified),
                 "size_bytes": s.file_size,
             }
-            for s, src, path in rows
+            for s, src, path, where in matched
         ])
         return 0
     if sys.stdout.isatty():
         # project before title: a long title would otherwise fold and push the
-        # project column (needed to resume) off-screen. Resume needs the cwd —
-        # `claude -r <id>` only finds a session in its own project directory.
+        # project column (needed to resume) off-screen.
         _print_table(
-            f"{len(rows)} sessions", ["src", "modified", "project", "session id", "title"],
+            f"{len(matched)} sessions", ["src", "modified", "id", "match", "project", "title"],
             [(
-                _src_cell(src), _fmt_ts(s.last_modified), path, s.session_id,
+                _src_cell(src), _fmt_ts(s.last_modified), short[s.session_id], where, path,
                 (s.summary or "").replace("\n", " ")[:_TITLE_WIDTH],
-            ) for s, src, path in rows],
+            ) for s, src, path, where in matched],
         )
         from rich.console import Console
         Console().print(
-            "[dim]Resume any session: [/][cyan]asm resume <session id>[/]"
-            "[dim]  (cds into its project automatically; Claude and Codex)[/]"
+            "[dim]Use the id with: [/][cyan]asm resume <id>[/][dim] · [/][cyan]asm preview <id>[/]"
+            "[dim] · [/][cyan]asm move <from> <to> --sessions <id>[/]"
         )
         return 0
 
-    for s, src, path in rows:
+    for s, src, path, where in matched:
         title = (s.summary or "").replace("\n", " ")[:_TITLE_WIDTH]
-        mark = "C" if src == "claude" else "X"
-        print(f"{mark} {_fmt_ts(s.last_modified)}  {s.session_id}  {title}  ({path})")
-    print(f"\n{len(rows)} sessions")
+        tag = f" [{where}]" if where else ""
+        print(f"{src:<6} {_fmt_ts(s.last_modified)}  {short[s.session_id]}{tag}  {title}  ({path})")
+    print(f"\n{len(matched)} sessions")
     return 0
 
 
 def cmd_preview(args) -> int:
     from asm.services import claude_data, codex_data
 
+    args.session_id = _resolve_session_id(args.session_id)
     # Resolve the owning project dir up front so the direct JSONL path is used
     # (the SDK lookup returns [] for ids it can't find instead of raising).
-    project = args.project or _find_claude_project_dir(args.session_id)
+    project = args.project or _find_claude_project_dir(args.session_id, args.project)
 
     messages = claude_data.get_session_messages(args.session_id, project, args.limit)
     if not messages and codex_data.is_available():
@@ -388,12 +499,20 @@ def _exec_resume(argv: list[str], cwd: str | None, dry_run: bool) -> int:
         if not os.path.isdir(cwd):
             print(f"project dir not found: {cwd}", file=sys.stderr)
             return 1
-        os.chdir(cwd)
+        try:
+            os.chdir(cwd)
+        except OSError as exc:
+            print(f"failed to enter project dir {cwd}: {exc}", file=sys.stderr)
+            return 1
     print(f"↻ (cwd: {cwd or os.getcwd()})  {' '.join(argv)}", file=sys.stderr)
     if dry_run:
         return 0
-    os.execvp(argv[0], argv)  # replaces this process; never returns on success
-    return 1  # only reached if execvp fails
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as exc:
+        print(f"failed to execute {argv[0]}: {exc}", file=sys.stderr)
+        return 1
+    return 1
 
 
 def cmd_resume(args) -> int:
@@ -404,11 +523,18 @@ def cmd_resume(args) -> int:
     """
     from asm.models import PROJECTS_DIR, decode_path_hint
 
-    sid = args.session_id
+    sid = args.session_id = _resolve_session_id(args.session_id)
 
-    enc = _find_claude_project_dir(sid)
+    enc = _find_claude_project_dir(sid, args.project)
     if enc:
-        cwd = _read_claude_session_cwd(PROJECTS_DIR / enc / f"{sid}.jsonl") or decode_path_hint(enc)
+        from asm.services import claude_data
+
+        cwd = (
+            _read_claude_session_cwd(PROJECTS_DIR / enc / f"{sid}.jsonl")
+            or (args.project if args.project and args.project.startswith("/") else None)
+            or next(iter(claude_data.project_paths_for_encoded(enc)), None)
+            or decode_path_hint(enc)  # lossy: last resort only
+        )
         return _exec_resume(["claude", "-r", sid], cwd, args.dry_run)
 
     from asm.services import codex_data
@@ -440,7 +566,7 @@ def cmd_clean(args) -> int:
                 ok += 1
             else:
                 fail += 1
-        print(f"trashed {ok}, failed {fail}")
+        _result(args, {"target": args.target, "trashed": ok, "failed": fail}, f"trashed {ok}, failed {fail}")
         return 0 if fail == 0 else 1
 
     if args.target == "orphaned":
@@ -451,7 +577,7 @@ def cmd_clean(args) -> int:
         if not _confirm(f"Trash {len(names)} orphaned session dir(s)?", args.yes):
             return 1
         ok, fail = cleaner.trash_sessions(names)
-        print(f"trashed {ok}, failed {fail}")
+        _result(args, {"target": args.target, "trashed": ok, "failed": fail}, f"trashed {ok}, failed {fail}")
         return 0 if fail == 0 else 1
 
     if args.target in ("debug", "todos"):
@@ -467,7 +593,7 @@ def cmd_clean(args) -> int:
         if not _confirm(f"Trash {len(names)} {label}?", args.yes):
             return 1
         ok, fail = prune()
-        print(f"trashed {ok}, failed {fail}")
+        _result(args, {"target": args.target, "trashed": ok, "failed": fail}, f"trashed {ok}, failed {fail}")
         return 0 if fail == 0 else 1
     return 1
 
@@ -508,8 +634,8 @@ def _backup_source_dirs_plugins():
 
 
 def _backup_source_dirs_codex():
-    from asm.models import CODEX_SESSIONS_DIR
-    return [CODEX_SESSIONS_DIR]
+    from asm.models import CODEX_DIR, CODEX_SESSIONS_DIR
+    return [CODEX_SESSIONS_DIR, *(CODEX_DIR / name for name in ("session_index.jsonl", "history.jsonl", "config.toml"))]
 
 
 # Directory-based backup types copy whole trees (possibly GBs) — the create
@@ -533,24 +659,6 @@ _BACKUP_RESTORERS = {
 
 def cmd_backup(args) -> int:
     from asm.services import backup
-
-    if args.action == "homes":
-        from asm.models import codex_homes
-
-        homes = []
-        for home in codex_homes():
-            sessions = home / "sessions"
-            count = sum(1 for _ in sessions.rglob("rollout-*.jsonl")) if sessions.is_dir() else 0
-            homes.append({"path": str(home), "exists": home.is_dir(), "sessions": count})
-        if args.json:
-            print(json.dumps({"codex_homes": homes}, ensure_ascii=False, indent=2))
-            return 0
-        print("Codex homes scanned (--codex-home / ASM_CODEX_HOMES override this):")
-        for h in homes:
-            mark = " " if h["exists"] else "!"
-            print(f" {mark} {h['path']}  {h['sessions']} sessions"
-                  + ("" if h["exists"] else "  (missing)"))
-        return 0
 
     if args.action == "list":
         items = backup.list_backups()
@@ -581,62 +689,48 @@ def cmd_backup(args) -> int:
                 return 1
         path = getattr(backup, _BACKUP_CREATORS[args.type])()
         if path:
-            print(path)
+            _result(args, {"action": "create", "type": args.type, "path": path}, path)
             return 0
-        print("backup failed", file=sys.stderr)
+        _result(args, {"action": "create", "type": args.type, "error": "backup failed"}, "backup failed", error=True)
         return 1
 
     if args.action == "restore":
         info = next((b for b in backup.list_backups() if b.path == args.path or b.name == args.path), None)
         if not info:
-            print(f"backup not found: {args.path}", file=sys.stderr)
+            _result(args, {"error": f"backup not found: {args.path}"}, f"backup not found: {args.path}", error=True)
             return 1
         if not _confirm(f"Restore {info.backup_type} backup '{info.name}'? Current data is replaced (rollback-safe)", args.yes):
             return 1
         result = getattr(backup, _BACKUP_RESTORERS[info.backup_type])(info.path)
         ok = result[0] if isinstance(result, tuple) else result
-        print("restored" if ok else "restore failed")
+        _result(args, {"action": "restore", "path": info.path, "restored": bool(ok)}, "restored" if ok else "restore failed", error=not ok)
         return 0 if ok else 1
 
     if args.action == "delete":
+        info = next((b for b in backup.list_backups() if b.path == args.path or b.name == args.path), None)
+        if not info:
+            _result(args, {"error": f"backup not found: {args.path}"}, f"backup not found: {args.path}", error=True)
+            return 1
         if not _confirm(f"Delete backup {args.path}?", args.yes):
             return 1
-        ok = backup.delete_backup(args.path)
-        print("deleted" if ok else "delete failed")
+        ok = backup.delete_backup(info.path)
+        _result(args, {"action": "delete", "path": info.path, "deleted": bool(ok)}, "deleted" if ok else "delete failed", error=not ok)
         return 0 if ok else 1
 
     if args.action == "export":
         out = backup.export_backup(args.path, dest_dir=args.dest)
-        print(out or "export failed")
+        _result(args, {"action": "export", "path": out} if out else {"action": "export", "error": "export failed"}, out or "export failed", error=not bool(out))
         return 0 if out else 1
 
     if args.action == "import":
         out = backup.import_backup(args.path)
-        print(out or "import failed")
+        _result(args, {"action": "import", "path": out} if out else {"action": "import", "error": "import failed"}, out or "import failed", error=not bool(out))
         return 0 if out else 1
     return 1
 
 
 def cmd_recovery(args) -> int:
     from asm.services import recovery
-
-    if args.action == "homes":
-        from asm.models import codex_homes
-
-        homes = []
-        for home in codex_homes():
-            sessions = home / "sessions"
-            count = sum(1 for _ in sessions.rglob("rollout-*.jsonl")) if sessions.is_dir() else 0
-            homes.append({"path": str(home), "exists": home.is_dir(), "sessions": count})
-        if args.json:
-            print(json.dumps({"codex_homes": homes}, ensure_ascii=False, indent=2))
-            return 0
-        print("Codex homes scanned (--codex-home / ASM_CODEX_HOMES override this):")
-        for h in homes:
-            mark = " " if h["exists"] else "!"
-            print(f" {mark} {h['path']}  {h['sessions']} sessions"
-                  + ("" if h["exists"] else "  (missing)"))
-        return 0
 
     if args.action == "list":
         items = recovery.list_recovery_items()
@@ -656,32 +750,39 @@ def cmd_recovery(args) -> int:
 
     if args.action == "restore":
         if not _confirm(f"Restore snapshot {args.id}?", args.yes):
+            _result(args, {"error": "cancelled"}, "cancelled", error=True)
             return 1
         ok, msg = recovery.restore_recovery_item(args.id, overwrite=args.overwrite)
-        print(msg)
+        _result(args, {"action": "restore", "id": args.id, "restored": bool(ok), "message": msg}, msg, error=not ok)
         return 0 if ok else 1
 
     if args.action == "delete":
         if not _confirm(f"Delete snapshot {args.id}?", args.yes):
+            _result(args, {"error": "cancelled"}, "cancelled", error=True)
             return 1
         ok = recovery.delete_recovery_item(args.id)
-        print("deleted" if ok else "delete failed")
+        _result(args, {"action": "delete", "id": args.id, "deleted": bool(ok)}, "deleted" if ok else "delete failed", error=not ok)
         return 0 if ok else 1
     return 1
 
 
-# ── trash / migrate ─────────────────────────────────────────────────────
+# ── trash / move ─────────────────────────────────────────────────────
 
 
 def cmd_trash(args) -> int:
     from asm.services import cleaner, codex_data
 
-    encoded_dir = _find_claude_project_dir(args.session_id)
+    args.session_id = _resolve_session_id(args.session_id)
+    from asm.services.live import ensure_claude_not_live, ensure_codex_not_live
+
+    encoded_dir = _find_claude_project_dir(args.session_id, args.project)
     if encoded_dir:
+        ensure_claude_not_live([args.session_id])
         if not _confirm(f"Trash Claude session {args.session_id} ({encoded_dir})?", args.yes):
+            _result(args, {"error": "cancelled"}, "cancelled", error=True)
             return 1
         ok = cleaner.trash_single_session_file(encoded_dir, args.session_id)
-        print("trashed" if ok else "trash failed")
+        _result(args, {"source": "claude", "session_id": args.session_id, "trashed": bool(ok)}, "trashed" if ok else "trash failed", error=not ok)
         return 0 if ok else 1
 
     if codex_data.is_available():
@@ -689,36 +790,154 @@ def cmd_trash(args) -> int:
         # must stay trashable by id.
         s = codex_data.find_session(args.session_id)
         if s:
+            ensure_codex_not_live([args.session_id], [Path(s.project_dir)])
             if not _confirm(f"Trash Codex session {args.session_id}?", args.yes):
+                _result(args, {"error": "cancelled"}, "cancelled", error=True)
                 return 1
             ok = cleaner.trash_codex_session(s.project_dir)  # rollout path
-            print("trashed" if ok else "trash failed")
+            _result(args, {"source": "codex", "session_id": args.session_id, "trashed": bool(ok)}, "trashed" if ok else "trash failed", error=not ok)
             return 0 if ok else 1
 
-    print(f"session not found: {args.session_id}", file=sys.stderr)
+    _result(args, {"error": f"session not found: {args.session_id}"}, f"session not found: {args.session_id}", error=True)
     return 1
 
 
-def cmd_migrate(args) -> int:
-    from asm.models import encode_path
-    from asm.services import migrate
+def cmd_move(args) -> int:
+    """Move a project's Claude and Codex sessions (all, or --sessions) to another path."""
+    return _move_or_copy(args, copy=False)
 
+
+def cmd_relocate(args) -> int:
+    """Move a whole project folder and re-point its Claude/Codex sessions and config."""
+    from asm.services import relocate
+
+    p = relocate.plan(args.src, args.dest)
+    n_claude = sum(len(ids) for _o, _n, ids in p.claude_projects)
+    summary = {
+        "from": p.old, "to": p.new,
+        "claude_sessions": n_claude, "claude_projects": [o for o, _n, _i in p.claude_projects],
+        "codex_sessions": len(p.codex_sessions),
+        "claude_config_keys": p.claude_config_keys, "codex_config_keys": p.codex_config_keys,
+        "git": p.git,
+    }
+    lines = [
+        f"  folder         {p.old}\n              -> {p.new}",
+        f"  Claude         {n_claude} session(s) in {len(p.claude_projects)} project dir(s)",
+        f"  Codex          {len(p.codex_sessions)} session(s)",
+        f"  ~/.claude.json {len(p.claude_config_keys)} project key(s)",
+        f"  Codex config   {len(p.codex_config_keys)} project key(s)",
+    ] + (["  git            worktree repair"] if p.git else [])
+    if args.dry_run:
+        _result(args, {**summary, "dry_run": True}, "Plan (dry run):\n" + "\n".join(lines))
+        return 0
+    if not _confirm("Relocate project?\n" + "\n".join(lines) + "\n(originals of moved sessions go to trash with a recovery snapshot)?", args.yes):
+        _result(args, {"error": "cancelled"}, "cancelled", error=True)
+        return 1
+
+    r = relocate.apply(p)
+    out = [f"moved folder; Claude {r.claude_moved}/{n_claude}, Codex {r.codex_moved}/{len(p.codex_sessions)} session(s)"]
+    out += [f"  FAILED {f}" for f in r.failures]
+    if r.failures:
+        out.append(f"  retry sessions with: asm move {p.old} {p.new}")
+    if r.git_repair:
+        out.append(f"  git worktree repair: {r.git_repair}")
+    if r.venv:
+        out.append("  .venv has the old path baked in: recreate it (e.g. `uv sync`)")
+    if r.references:
+        out.append(f"  {len(r.references)} file(s) still mention the old path (not changed):")
+        out += [f"    {f}" for f in r.references]
+    payload = {
+        **summary, "success": not r.failures, "claude_moved": r.claude_moved, "codex_moved": r.codex_moved,
+        "failures": r.failures, "git_repair": r.git_repair, "venv": r.venv, "references": r.references,
+    }
+    _result(args, payload, "\n".join(out), error=bool(r.failures))
+    return 1 if r.failures else 0
+
+
+def cmd_copy(args) -> int:
+    """Duplicate sessions into another path under new ids; originals stay."""
+    return _move_or_copy(args, copy=True)
+
+
+def _move_or_copy(args, copy: bool) -> int:
+    import os
+
+    from asm.models import PROJECTS_DIR, encode_path
+    from asm.services import codex_data, migrate
+
+    src, dest = os.path.normpath(args.src), os.path.normpath(args.dest)
+    if src == dest:
+        _result(args, {"error": "source and destination are the same"}, "source and destination are the same", error=True)
+        return 1
+    claude_dir = PROJECTS_DIR / encode_path(src)
+    claude_all = {f.stem for f in claude_dir.glob("*.jsonl")} if claude_dir.is_dir() else set()
+    codex_all = (
+        {s.session_id: s.project_dir for s in codex_data.get_project_sessions(src)}
+        if codex_data.is_available() else {}
+    )
+    if args.sessions:
+        claude_sel: list[str] = []
+        codex_sel: list[str] = []
+        for raw in args.sessions:
+            cands = {i for i in claude_all | set(codex_all) if i.startswith(raw)}
+            if len(cands) != 1:
+                why = "not found" if not cands else "ambiguous"
+                msg = f"session {raw} {why} in {src}" + (f": {', '.join(sorted(cands)[:5])}" if cands else "")
+                _result(args, {"error": msg}, msg, error=True)
+                return 1
+            sid = cands.pop()
+            (claude_sel if sid in claude_all else codex_sel).append(sid)
+    else:
+        claude_sel, codex_sel = sorted(claude_all), sorted(codex_all)
+    if not claude_sel and not codex_sel:
+        _result(args, {"error": f"no sessions in {src}"}, f"no sessions in {src}", error=True)
+        return 1
+
+    if not copy:  # refuse before touching anything, so a move is never half done
+        from asm.services.live import ensure_claude_not_live, ensure_codex_not_live
+
+        ensure_claude_not_live(claude_sel, [claude_dir / f"{sid}.jsonl" for sid in claude_sel])
+        ensure_codex_not_live(codex_sel, [Path(codex_all[sid]) for sid in codex_sel])
+    verb = "Copy" if copy else "Move"
+    note = "(copies get new session ids; originals stay)" if copy else "(originals go to trash with a recovery snapshot)"
     if not _confirm(
-        f"Migrate sessions {args.src} -> {args.dest}"
-        + (f" ({len(args.sessions)} selected)" if args.sessions else " (all)") + "?",
+        f"{verb} {len(claude_sel)} Claude + {len(codex_sel)} Codex session(s)\n  {src}\n  -> {dest}\n{note}?",
         args.yes,
     ):
+        _result(args, {"error": "cancelled"}, "cancelled", error=True)
         return 1
-    result = migrate.migrate_sessions(
-        source_path=args.src,
-        target_path=args.dest,
-        source_encoded=encode_path(args.src),
-        target_encoded=encode_path(args.dest),
-        session_ids=args.sessions or None,
-    )
-    print(f"{'ok' if result.success else 'failed'}: {result.sessions_copied} session(s) copied"
-          + (f" — {result.message}" if result.message else ""))
-    return 0 if result.success else 1
+
+    payload: dict = {"from": src, "to": dest}
+    ok = True
+    lines = []
+    done = "copied" if copy else "moved"
+    if claude_sel:
+        r = migrate.migrate_sessions(source_path=src, target_path=dest, session_ids=claude_sel, copy=copy)
+        ok = ok and r.success
+        payload["claude"] = {
+            "success": r.success, done: r.sessions_copied, "skipped": r.sessions_skipped,
+            "ids": r.new_ids, "message": r.message,
+        }
+        lines.append(f"Claude: {'ok' if r.success else 'failed'} — {r.message}")
+    if codex_sel:
+        ids: dict[str, str] = {}
+        failed = []
+        for sid in codex_sel:
+            if copy:
+                new_id = codex_data.copy_session(codex_all[sid], dest)
+            else:
+                new_id = sid if codex_data.move_session(codex_all[sid], dest) else None
+            if new_id:
+                ids[sid] = new_id
+            else:
+                failed.append(sid)
+        ok = ok and not failed
+        payload["codex"] = {done: len(ids), "failed": failed, "ids": ids}
+        shown = ", ".join(f"{a[:8]} -> {b[:8]}" for a, b in ids.items()) if copy else ""
+        lines.append(f"Codex: {len(ids)} {done}" + (f" ({shown})" if shown else "") + (f", failed: {', '.join(failed)}" if failed else ""))
+    payload["success"] = ok
+    _result(args, payload, "\n".join(lines), error=not ok)
+    return 0 if ok else 1
 
 
 # ── parser wiring ───────────────────────────────────────────────────────
@@ -752,48 +971,48 @@ def _resolve_import_source(session_id: str):
 def cmd_import(args) -> int:
     from asm.services import agent_import
 
+    if args.action == "home":
+        from asm.models import CODEX_DIR, CODEX_SESSIONS_DIR
+
+        count = sum(1 for _ in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl")) if CODEX_SESSIONS_DIR.is_dir() else 0
+        payload = {"path": str(CODEX_DIR), "exists": CODEX_DIR.is_dir(), "sessions": count}
+        if args.json:
+            print(json.dumps({"codex_home": payload}, ensure_ascii=False, indent=2))
+        else:
+            suffix = "" if payload["exists"] else "  (missing)"
+            print(f"Codex home: {payload['path']}  {payload['sessions']} sessions{suffix}")
+        return 0
+
     if args.action == "mcp":
         plan = agent_import.plan_mcp(_import_direction(args.to))
-        if args.json:
-            print(json.dumps({
-                "new": [s.name for s in plan.new],
-                "already_present": plan.already_present,
-                "unsupported": [{"name": n, "reason": r} for n, r in plan.unsupported],
-            }, ensure_ascii=False, indent=2))
-        else:
-            print(f"{plan.source} -> {plan.target}: {len(plan.new)} importable, "
-                  f"{len(plan.already_present)} already there")
-            for server in plan.new:
-                print(f"  + {server.name} ({server.transport})")
-            for name, reason in plan.unsupported:
-                print(f"  - {name}: {reason}")
+        plan_payload = {
+            "source": plan.source,
+            "target": plan.target,
+            "new": [s.name for s in plan.new],
+            "already_present": plan.already_present,
+            "unsupported": [{"name": n, "reason": r} for n, r in plan.unsupported],
+        }
         if args.dry_run or not plan.new:
+            if args.json:
+                _out_json(plan_payload)
+            else:
+                print(f"{plan.source} -> {plan.target}: {len(plan.new)} importable, "
+                      f"{len(plan.already_present)} already there")
+                for server in plan.new:
+                    print(f"  + {server.name} ({server.transport})")
+                for name, reason in plan.unsupported:
+                    print(f"  - {name}: {reason}")
             return 0
         if not _confirm(f"Import {len(plan.new)} MCP server(s) into {plan.target}?", args.yes):
             return 1
         result = agent_import.apply_mcp(plan)
-        print(f"imported {len(result.imported)}, failed {len(result.failed)}")
-        for name, reason in result.failed:
-            print(f"  ! {name}: {reason}", file=sys.stderr)
-        return 1 if result.failed else 0
-
-    if args.action == "homes":
-        from asm.models import codex_homes
-
-        homes = []
-        for home in codex_homes():
-            sessions = home / "sessions"
-            count = sum(1 for _ in sessions.rglob("rollout-*.jsonl")) if sessions.is_dir() else 0
-            homes.append({"path": str(home), "exists": home.is_dir(), "sessions": count})
         if args.json:
-            print(json.dumps({"codex_homes": homes}, ensure_ascii=False, indent=2))
-            return 0
-        print("Codex homes scanned (--codex-home / ASM_CODEX_HOMES override this):")
-        for h in homes:
-            mark = " " if h["exists"] else "!"
-            print(f" {mark} {h['path']}  {h['sessions']} sessions"
-                  + ("" if h["exists"] else "  (missing)"))
-        return 0
+            _out_json({**plan_payload, "imported": result.imported, "failed": result.failed, "backup_path": result.backup_path})
+        else:
+            print(f"imported {len(result.imported)}, failed {len(result.failed)}")
+            for name, reason in result.failed:
+                print(f"  ! {name}: {reason}", file=sys.stderr)
+        return 1 if result.failed else 0
 
     if args.action == "list":
         plan = (agent_import.plan_sessions_to_codex() if args.to == "codex"
@@ -826,30 +1045,39 @@ def cmd_import(args) -> int:
         target = "claude"
 
     if plan.skipped:
-        for _p, reason in plan.skipped:
-            print(f"skipped: {reason}", file=sys.stderr)
+        if args.json:
+            _out_json({"error": "session skipped", "skipped": plan.skipped})
+        else:
+            for _p, reason in plan.skipped:
+                print(f"skipped: {reason}", file=sys.stderr)
         return 1
     if plan.already_imported and not plan.new:
-        print(f"already imported into {target}; nothing to do")
+        _result(args, {"target": target, "already_imported": True}, f"already imported into {target}; nothing to do")
         return 0
 
     candidate = plan.new[0]
     origin = f"  [{path.parents[4].name}]" if source == "codex" and len(path.parents) > 4 else ""
-    print(f"{source} -> {target}: {candidate.turns} turns  cwd={candidate.cwd}{origin}")
-    print(f"  title: {candidate.title[:70]}")
+    if not args.json:
+        print(f"{source} -> {target}: {candidate.turns} turns  cwd={candidate.cwd}{origin}")
+        print(f"  title: {candidate.title[:70]}")
     if args.dry_run:
+        if args.json:
+            _out_json({"source": source, "target": target, "candidate": vars(candidate), "dry_run": True})
         return 0
     if not _confirm(f"Import this session into {target}?", args.yes):
         return 1
 
     result = (agent_import.apply_sessions_to_codex(plan) if target == "codex"
               else agent_import.apply_sessions_to_claude(plan))
-    for _src, new_id in result.imported:
-        print(f"imported as {new_id}")
-    for name, reason in result.failed:
-        print(f"  ! {name}: {reason}", file=sys.stderr)
-    if result.backup_path:
-        print(f"backup: {result.backup_path}")
+    if args.json:
+        _out_json({"source": source, "target": target, "imported": result.imported, "failed": result.failed, "backup_path": result.backup_path})
+    else:
+        for _src, new_id in result.imported:
+            print(f"imported as {new_id}")
+        for name, reason in result.failed:
+            print(f"  ! {name}: {reason}", file=sys.stderr)
+        if result.backup_path:
+            print(f"backup: {result.backup_path}")
     return 1 if result.failed else 0
 
 
@@ -873,7 +1101,7 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     p = sub.add_parser("cost", help="cost/token usage stats")
     p.add_argument("--period", choices=["daily", "weekly", "monthly"], default="daily")
     p.add_argument("--source", choices=["all", "claude", "codex"], default="all")
-    p.add_argument("--limit", type=int, default=14, help="max period rows (default 14, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=14, help="max period rows (default 14, 0 = all)")
     _common(p)
     p.set_defaults(func=cmd_cost)
 
@@ -882,28 +1110,32 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
     _common(p)
     p.set_defaults(func=cmd_projects)
 
-    p = sub.add_parser("sessions", help="list/search sessions by title")
+    p = sub.add_parser("find", help="find sessions by title and conversation content")
+    p.add_argument("query", nargs="?", help="text to find (spaces/case ignored); omit to list recent sessions")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--only-title", action="store_true", help="match session titles only")
+    scope.add_argument("--only-content", action="store_true", help="match conversation bodies only")
     p.add_argument("--project", help="limit to one project path")
-    p.add_argument("--search", help="substring match on session title")
     p.add_argument("--source", choices=["all", "claude", "codex"], default="all")
-    p.add_argument("--limit", type=int, default=50, help="max rows (default 50, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=50, help="max rows (default 50, 0 = all)")
     _common(p)
-    p.set_defaults(func=cmd_sessions)
+    p.set_defaults(func=cmd_find)
 
     p = sub.add_parser("preview", help="print a session's conversation")
     p.add_argument("session_id")
     p.add_argument("--project", help="project path hint (faster lookup)")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--limit", type=_non_negative_int, default=50)
     _common(p)
     p.set_defaults(func=cmd_preview)
 
     p = sub.add_parser("artifacts", help="list artifacts published from Claude Code sessions")
-    p.add_argument("--limit", type=int, default=50, help="max rows (default 50, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=50, help="max rows (default 50, 0 = all)")
     _common(p)
     p.set_defaults(func=cmd_artifacts)
 
     p = sub.add_parser("resume", help="cd into a session's project and resume it (Claude/Codex)")
     p.add_argument("session_id")
+    p.add_argument("--project", help="project path or encoded dir, when the id exists in several projects")
     p.add_argument("--dry-run", action="store_true", help="print the command + cwd instead of running it")
     p.set_defaults(func=cmd_resume)
 
@@ -933,14 +1165,16 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
 
     p = sub.add_parser("trash", help="trash one session by id (Claude or Codex)")
     p.add_argument("session_id")
+    p.add_argument("--project", help="Claude project path when a session id is duplicated")
     p.add_argument("--yes", action="store_true", help="skip confirmation")
+    _common(p)
     p.set_defaults(func=cmd_trash)
 
     p = sub.add_parser(
         "import",
-        help="move MCP servers or sessions between Claude Code and Codex",
+        help="copy MCP servers or sessions between Claude Code and Codex",
         description=(
-            "Move MCP servers or sessions between Claude Code and Codex.\n"
+            "Copy MCP servers or sessions between Claude Code and Codex.\n"
             "\n"
             "Sessions are listed newest-first by LAST ACTIVITY (file mtime), which is not\n"
             "the timestamp in a Codex rollout filename -- that one is when the session\n"
@@ -952,49 +1186,74 @@ def add_cli_subparsers(parser: argparse.ArgumentParser) -> None:
             "25k+ rollouts is slow); the count left out is reported, never hidden.\n"
             "\n"
             "Imported copies get a NEW id and are recorded so re-running skips them.\n"
-            "They carry zero token usage, so a moved session is never priced twice.\n"
+            "They carry zero token usage, so a copied session is never priced twice.\n"
             "The destination folder is chosen from the session's own cwd.\n"
             "\n"
-            "Codex keeps one home per login, so a second account lives in its own\n"
-            "directory. asm scans CODEX_HOME (or ~/.codex) plus any sibling ~/.codex-*\n"
-            "holding a sessions/ tree. Override that with --codex-home (repeatable) or\n"
-            "ASM_CODEX_HOMES (os.pathsep-separated); `asm import homes` prints what is\n"
-            "actually being scanned.\n"
+            "Codex App, CLI and companion agents share one CODEX_HOME (default ~/.codex).\n"
+            "asm never auto-discovers sibling ~/.codex-* directories. To inspect legacy\n"
+            "split-home data for one run, start asm with CODEX_HOME=/path/to/legacy-home.\n"
+            "`asm import home` prints the active data home.\n"
             "\n"
             "Examples:\n"
-            "  asm import homes                       # which Codex homes are scanned\n"
-            "  asm import list --to claude            # what could move Codex -> Claude\n"
+            "  asm import home                        # active Codex data home\n"
+            "  asm import list --to claude            # what could be copied Codex -> Claude\n"
             "  asm import session <id> --dry-run      # direction inferred from the id\n"
             "  asm import session <id> --yes\n"
             "  asm import mcp --to codex              # MCP servers Claude -> Codex\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("action", choices=["session", "mcp", "list", "homes"],
-                   help="session: move one session by id; mcp: move MCP servers; "
-                        "list: importable sessions; homes: Codex homes being scanned")
+    p.add_argument("action", choices=["session", "mcp", "list", "home"],
+                   help="session: copy one session by id; mcp: copy MCP servers; "
+                        "list: importable sessions; home: active Codex data home")
     p.add_argument("session_id", nargs="?", help="session id (action=session)")
     p.add_argument("--to", choices=["codex", "claude"], default="claude",
                    help="destination agent for mcp/list (default: claude); session infers it from the id")
-    p.add_argument("--limit", type=int, default=50, help="max rows for list (default 50, 0 = all)")
+    p.add_argument("--limit", type=_non_negative_int, default=50, help="max rows for list (default 50, 0 = all)")
     p.add_argument("--dry-run", action="store_true", help="show what would happen, write nothing")
     p.add_argument("--yes", action="store_true", help="skip confirmation")
     _common(p)
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("migrate", help="copy sessions to another project path")
-    p.add_argument("src", help="source project path")
-    p.add_argument("dest", help="target project path")
-    p.add_argument("--sessions", nargs="*", help="session ids (default: all)")
+    p = sub.add_parser("move", help="move sessions from one project path to another (originals to trash)")
+    p.add_argument("src", help="project path the sessions belong to now")
+    p.add_argument("dest", help="project path to move them to")
+    p.add_argument("--sessions", nargs="+", help="session ids or unique id prefixes (default: all in src)")
     p.add_argument("--yes", action="store_true", help="skip confirmation")
-    p.set_defaults(func=cmd_migrate)
+    _common(p)
+    p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser(
+        "relocate",
+        help="move a whole project folder plus its Claude/Codex sessions and config (no AI; leftovers are listed)",
+    )
+    p.add_argument("src", help="current project folder")
+    p.add_argument("dest", help="new project folder (must not exist; same filesystem)")
+    p.add_argument("--dry-run", action="store_true", help="show what would change, change nothing")
+    p.add_argument("--yes", action="store_true", help="skip confirmation")
+    _common(p)
+    p.set_defaults(func=cmd_relocate)
+
+    p = sub.add_parser("copy", help="copy sessions to another project path under new session ids (originals stay)")
+    p.add_argument("src", help="project path the sessions belong to")
+    p.add_argument("dest", help="project path to copy them to")
+    p.add_argument("--sessions", nargs="+", help="session ids or unique id prefixes (default: all in src)")
+    p.add_argument("--yes", action="store_true", help="skip confirmation")
+    _common(p)
+    p.set_defaults(func=cmd_copy)
 
 
 def run_cli(args) -> int:
     """Dispatch a parsed subcommand; returns the process exit code."""
     # Validate positional combos argparse can't express.
+    if args.command == "backup" and args.action in ("list", "create") and args.path:
+        print(f"backup {args.action} does not accept a path", file=sys.stderr)
+        return 2
     if args.command == "backup" and args.action in ("restore", "delete", "export", "import") and not args.path:
         print(f"backup {args.action} requires a path", file=sys.stderr)
+        return 2
+    if args.command == "recovery" and args.action == "list" and args.id:
+        print("recovery list does not accept an id", file=sys.stderr)
         return 2
     if args.command == "recovery" and args.action in ("restore", "delete") and not args.id:
         print(f"recovery {args.action} requires an id", file=sys.stderr)
@@ -1002,4 +1261,14 @@ def run_cli(args) -> int:
     if args.command == "import" and args.action == "session" and not args.session_id:
         print("import session requires a session id", file=sys.stderr)
         return 2
-    return args.func(args)
+    if args.command == "import" and args.action != "session" and args.session_id:
+        print(f"import {args.action} does not accept a session id", file=sys.stderr)
+        return 2
+    try:
+        return args.func(args)
+    except Exception as exc:
+        if getattr(args, "json", False):
+            _out_json({"error": str(exc)})
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 1

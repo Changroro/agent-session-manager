@@ -61,7 +61,7 @@
 - **고아 정리:** 매칭 프로젝트 없는 Claude 세션·파일히스토리·디버그·task 일괄 정리
 - **중복 세션:** 여러 프로젝트에 복사된 동일 세션을 찾아 개별 복사본 삭제
 - **빈 세션:** 제목/메타만 있고 대화가 없는(resume 불가) stub 세션 정리
-- **마이그레이션:** Claude 프로젝트 간 세션 복사(원본 유지), 경로 자동 갱신
+- **이동 / 복사:** 세션을 다른 프로젝트로 이동(id 유지, 원본은 복구 스냅샷과 함께 휴지통) 또는 새 id로 복사(원본 유지). 서브에이전트·도구 결과 폴더 포함, 경로 자동 갱신. `relocate`는 프로젝트 폴더 자체도 옮기고, 옛 경로가 남은 파일은 목록으로 알려 줌. 실행 중인 Claude Code·Codex가 쓰고 있는 세션은 거부
 
 ### 아티팩트
 - Claude Code **Artifact 도구**로 발행한 페이지를 세션 기록에서 찾아 최신순으로 나열
@@ -69,8 +69,8 @@
 
 ### Claude ↔ Codex (`F8` 탭)
 - **MCP 서버 양방향:** `~/.codex/config.toml`과 `~/.claude.json`을 비교해 한쪽에만 있는 항목을 찾고, 각 에이전트의 `mcp add` CLI로 추가한다(파일 포맷·주석 보존). 인증 헤더와 env는 그대로 옮기며, `codex mcp add`가 HTTP 헤더를 표현하지 못해 그 부분만 `[mcp_servers.<name>.http_headers]`로 덧붙인다
-- **세션 양방향:** Claude 대화록 ↔ Codex rollout 스레드 변환 — 실제 CLI에서 resume해 맥락이 복원되는 것까지 확인했다. Claude→Codex는 공식 importer와 같은 `content_sha256` 원장에 기록해 Codex가 이미 가져온 세션을 중복 생성하지 않고, `/import`와 달리 원하는 세션만 고를 수 있다(30일·50개 제한 없음)
-- 가져온 사본은 **토큰 사용량이 0**으로 기록돼, 옮긴 세션이 두 번 과금 집계되지 않는다
+- **세션 양방향 복사:** Claude 대화록 ↔ Codex rollout 스레드 변환 — 실제 CLI에서 resume해 맥락이 복원되는 것까지 확인했다. Claude→Codex는 공식 importer와 같은 `content_sha256` 원장에 기록해 Codex가 이미 가져온 세션을 중복 생성하지 않고, `/import`와 달리 원하는 세션만 고를 수 있다(30일·50개 제한 없음)
+- 가져온 사본은 **토큰 사용량이 0**으로 기록돼, 복사한 세션이 두 번 과금 집계되지 않는다
 - 쓰기 전에 항상 계획을 먼저 보여준다: 가져올 수 있음 / 건너뜀 / 미지원 목록을 미리 확인하고, 첫 쓰기 전에 백업 스냅샷을 만든다
 - **기본 선택은 없다.** 계획은 최신 200개까지만 잡고(2.5만 개 rollout을 전부 해시하면 느리다), 제외된 오래된 개수를 함께 표시해 잘린 목록이 "이게 전부"로 읽히지 않게 한다
 
@@ -148,17 +148,17 @@ asm --no-update-check     # 시작 시 업데이트 확인 건너뛰기
 
 ### Headless CLI
 
-모든 기능을 서브커맨드로도 쓸 수 있습니다 — 스크립트나 AI 에이전트에서 유용합니다. 터미널에서는 rich 테이블, 파이프로 받으면 plain text, `--json`이면 기계가 읽는 JSON으로 출력됩니다.
+데이터 작업은 스크립트나 AI 에이전트에서 쓸 수 있도록 headless 서브커맨드로 제공합니다. instruction 편집, Codex cwd 이동, Artifact 브라우저/클립보드 동작은 TUI에서 제공합니다. 터미널에서는 rich 테이블, 파이프로 받으면 plain text, `--json`이면 기계가 읽는 JSON으로 출력됩니다.
 
 ```bash
 # 조회 (읽기 전용)
 asm cost --period weekly          # 모델별·기간별 비용/토큰 통계
 asm projects                      # 전체 프로젝트 (Claude + Codex)
-asm sessions --search "방화벽"     # 세션 제목 검색
+asm find "방화벽"                 # 제목+본문 검색 (--only-title / --only-content)
 asm preview <session-id>          # 대화 내용 출력
-asm resume <session-id>           # 세션의 프로젝트로 이동해 바로 resume (Claude/Codex)
+asm resume <session-id>           # 세션의 프로젝트로 이동해 바로 resume (Claude/Codex, 중복 id면 --project)
 asm artifacts                     # Artifact 도구로 발행한 페이지 목록
-asm import list --to claude       # Codex -> Claude 로 옮길 수 있는 세션
+asm import list --to claude       # Codex -> Claude 로 복사할 수 있는 세션
 asm backup list / asm recovery list
 
 # 변경 — 실행 전 항상 확인을 묻습니다(--yes로 생략). TUI와 동일하게
@@ -167,13 +167,16 @@ asm clean empty --dry-run         # empty | orphaned | debug | todos
 asm trash <session-id>
 asm backup create --type full     # config|full|settings|plugins|sessions|codex
 asm backup restore <path> / asm recovery restore <id>
-asm migrate /old/project /new/project
-asm import session <session-id>   # 세션 1개 이동(방향은 id로 자동 판별)
-asm import mcp --to codex         # MCP 서버 이동
+asm move /old/project /new/project                # 그 프로젝트 세션 전부 이동(Claude+Codex), 원본은 휴지통
+asm move /old/project /new/project --sessions 3f2a1b9c   # 지정한 세션만 (id 앞자리 가능)
+asm copy /old/project /new/project --sessions 3f2a1b9c   # 새 세션 id로 복제, 원본 유지
+asm relocate /old/project /new/project --dry-run          # 프로젝트 폴더째 이동 + 세션 + ~/.claude.json·Codex 설정 키
+asm import session <session-id>   # 세션 1개 복사(방향은 id로 자동 판별)
+asm import mcp --to codex         # MCP 서버 복사
 ```
 
-Codex에 계정을 두 개 이상 쓰고 있다면 로그인마다 홈이 따로 생긴다 —
-[Codex 계정이 여러 개일 때](docs/multiple-codex-accounts.ko.md) 참고.
+Codex App·CLI·동반 에이전트는 세션 저장소 하나를 공유한다 —
+[Codex 데이터 홈](docs/codex-data-home.ko.md) 참고.
 
 `asm import list`는 **마지막 활동 시각** 기준으로 정렬한다 — Codex rollout 파일명의
 시각은 세션을 *시작한* 때라 순서가 다르게 보인다. 그래서 활동 시각을 함께 출력해

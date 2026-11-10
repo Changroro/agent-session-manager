@@ -266,11 +266,10 @@ def test_live_import_into_claude_config_dir(tmp_path, monkeypatch):
 
 
 def test_live_import_leaves_real_user_data_untouched():
-    real_claude = Path.home() / ".claude.json"
-    real_codex = Path.home() / ".codex" / "config.toml"
+    from asm import models
 
-    assert agent_import.CLAUDE_JSON == real_claude
-    assert agent_import.CODEX_CONFIG == real_codex
+    assert agent_import.CLAUDE_JSON == models.CLAUDE_JSON
+    assert agent_import.CODEX_CONFIG == models.CODEX_DIR / "config.toml"
     assert agent_import.SUBPROCESS_ENV == {}
 
 
@@ -464,6 +463,7 @@ def test_asm_codex_parser_reads_the_written_rollout(claude_session, monkeypatch)
     from asm.services import backup, codex_data
 
     monkeypatch.setattr(backup, "create_codex_backup", lambda: None)
+    monkeypatch.setattr(agent_import, "codex_cli_version", lambda: "0.145.0")
     agent_import.apply_sessions_to_codex(agent_import.plan_sessions_to_codex())
     monkeypatch.setattr(codex_data, "CODEX_SESSIONS_DIR", agent_import.CODEX_SESSIONS_DIR)
     codex_data.refresh()
@@ -752,77 +752,32 @@ def test_title_falls_back_when_every_user_turn_is_a_preamble(claude_session, tmp
 
     plan = agent_import.plan_sessions_to_codex([only_preamble])
 
-    # Claude drops `<`-prefixed user turns, so only the assistant turn survives.
-    assert plan.new[0].title == "답변"
+    assert plan.new[0].title == "<wrapper>only this</wrapper>"
 
 
-# --- Multiple Codex homes (one per account) ---
+# --- Single active Codex home ---
 
 
-def test_codex_homes_discovers_sibling_home(monkeypatch, tmp_path):
-    from asm import models
-
-    home = tmp_path / "home"
-    (home / ".codex" / "sessions").mkdir(parents=True)
-    (home / ".codex-work" / "sessions").mkdir(parents=True)
-    (home / ".codex-nosessions").mkdir()
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.setattr(models, "CODEX_DIR", home / ".codex")
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    monkeypatch.delenv("ASM_CODEX_HOMES", raising=False)
-
-    homes = models.codex_homes()
-
-    assert homes == [home / ".codex", home / ".codex-work"]
-
-
-def test_asm_codex_homes_env_wins_over_discovery(monkeypatch, tmp_path):
-    import os
-
-    from asm import models
-
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    monkeypatch.setenv("ASM_CODEX_HOMES", os.pathsep.join([str(tmp_path / "a"), str(tmp_path / "b")]))
-
-    assert models.codex_homes() == [tmp_path / "a", tmp_path / "b"]
-
-
-def test_set_codex_homes_overrides_everything(monkeypatch, tmp_path):
-    from asm import models
-
-    monkeypatch.setenv("ASM_CODEX_HOMES", str(tmp_path / "ignored"))
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    models.set_codex_homes([str(tmp_path / "picked")])
-    try:
-        assert models.codex_homes() == [tmp_path / "picked"]
-    finally:
-        models.set_codex_homes(None)
-
-
-def test_rollouts_and_lookup_span_every_home(monkeypatch, tmp_path):
-    from asm import models
-
-    primary = tmp_path / ".codex"
-    second = tmp_path / ".codex-work"
-    for home, sid in ((primary, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-                      (second, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")):
-        target = home / "sessions" / "2026" / "08" / "05"
+def test_rollouts_ignore_sibling_legacy_home(monkeypatch, tmp_path):
+    active = tmp_path / ".codex" / "sessions"
+    legacy = tmp_path / ".codex-hermes" / "sessions"
+    active_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    legacy_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    for directory, sid in ((active, active_id), (legacy, legacy_id)):
+        target = directory / "2026" / "08" / "05"
         target.mkdir(parents=True)
         (target / f"rollout-2026-08-05T09-00-00-{sid}.jsonl").write_text(
             "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _rollout_rows()),
             encoding="utf-8",
         )
-    monkeypatch.setattr(models, "CODEX_DIR", primary)
-    monkeypatch.setattr(agent_import, "CODEX_SESSIONS_DIR", primary / "sessions")
-    monkeypatch.setattr(models, "_codex_home_override", None)
-    monkeypatch.delenv("ASM_CODEX_HOMES", raising=False)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(agent_import, "CODEX_SESSIONS_DIR", active)
 
-    assert len(agent_import.codex_rollout_files()) == 2
-    found = agent_import.find_codex_rollout("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
-    assert found is not None and found.parents[4].name == ".codex-work"
-    assert agent_import.find_codex_rollout("no-such-id") is None
+    listed = agent_import.codex_rollout_files()
 
+    assert len(listed) == 1
+    assert active_id in listed[0].name
+    assert agent_import.find_codex_rollout(active_id) == listed[0]
+    assert agent_import.find_codex_rollout(legacy_id) is None
 
 def test_title_skips_hash_prefixed_preamble(claude_session):
     """A leading `# AGENTS.md ...` dump is injected context, not a label."""
@@ -851,3 +806,20 @@ def test_title_skips_hash_prefixed_preamble(claude_session):
 
     turns, _cwd, _tokens = agent_import.read_claude_session(target)
     assert agent_import._title_of(turns) == "실제 질문"
+
+
+def test_apply_to_claude_refuses_candidate_without_cwd(codex_rollout, monkeypatch):
+    """A wrong-direction candidate (e.g. a Claude transcript) must not land in projects/ root."""
+    from asm.services import backup
+
+    monkeypatch.setattr(backup, "create_sessions_backup", lambda: None)
+    monkeypatch.setattr(agent_import, "claude_cli_version", lambda: "2.1.228")
+    stray = codex_rollout.parent / "not-a-rollout.jsonl"
+    stray.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+    candidate = agent_import.plan_sessions_to_claude().new[0]
+    candidate.path = str(stray)
+
+    result = agent_import.apply_sessions_to_claude(agent_import.SessionPlan(new=[candidate]))
+
+    assert result.imported == [] and len(result.failed) == 1
+    assert not list(agent_import.PROJECTS_DIR.glob("*.jsonl"))

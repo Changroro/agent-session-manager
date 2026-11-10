@@ -132,15 +132,17 @@ class MigratePane(Container):
         st.zebra_stripes = True
         st.add_columns("", "Date", "Session", "Size")
         self._render_actions()
-        self.run_worker(self._load_projects, thread=True)
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.run_worker(self._load_projects, thread=True)
 
     def _render_actions(self) -> None:
         bar = self.query_one("#migrate-actions", ActionBar)
         mode_label = "Append" if self._mode == "append" else "Overwrite"
         bar.set_actions(
             [
-                ("toggle_mode", f"Mode: {mode_label}", "#555555"),
-                ("migrate", "Migrate", "#ba3c5b"),
+                ("toggle_mode", f"Move mode: {mode_label}", "#555555"),
+                ("migrate", "Move", "#ba3c5b"),
+                ("copy", "Copy", "#0178d4"),
             ],
             on_action=self._on_action,
         )
@@ -151,6 +153,8 @@ class MigratePane(Container):
             self._render_actions()
         elif action_id == "migrate":
             self._start_migrate()
+        elif action_id == "copy":
+            self._start_migrate(copy=True)
 
     def _load_projects(self) -> None:
         projects = get_available_projects()
@@ -413,7 +417,7 @@ class MigratePane(Container):
             f"[dim]Enter: preview[/]"
         )
 
-    def _start_migrate(self) -> None:
+    def _start_migrate(self, copy: bool = False) -> None:
         if not self._source_encoded:
             self.app.notify(t("mig.select_source"), severity="error")
             return
@@ -430,15 +434,17 @@ class MigratePane(Container):
         sel = len(self._selected_sessions)
         total = len(self._session_rows)
         count_info = f"all {total}" if sel == total else f"{sel} of {total}"
+        prompt = (
+            t("mig.confirm_copy", src=self._source_hint, tgt=self._target_hint)
+            if copy
+            else t("mig.confirm", src=self._source_hint, tgt=self._target_hint, mode=self._mode)
+        )
         self.app.push_screen(
-            ConfirmScreen(
-                t("mig.confirm", src=self._source_hint, tgt=self._target_hint, mode=self._mode)
-                + f"\n({count_info} sessions selected)"
-            ),
-            callback=lambda ok: self._do_migrate() if ok else None,
+            ConfirmScreen(prompt + f"\n({count_info} sessions selected)"),
+            callback=lambda ok: self._do_migrate(copy) if ok else None,
         )
 
-    def _do_migrate(self) -> None:
+    def _do_migrate(self, copy: bool = False) -> None:
         src_hint = self._source_hint
         tgt_hint = self._target_hint
         src_enc = self._source_encoded
@@ -448,12 +454,13 @@ class MigratePane(Container):
         selected = list(self._selected_sessions)
         mode = self._mode
         self.run_worker(
-            lambda: self._execute_migrate(src_hint, tgt_hint, src_enc, tgt_enc, mode, selected),
+            lambda: self._execute_migrate(src_hint, tgt_hint, src_enc, tgt_enc, mode, selected, copy),
             thread=True,
         )
 
-    def _execute_migrate(self, src_hint, tgt_hint, src_enc, tgt_enc, mode, session_ids) -> None:
+    def _execute_migrate(self, src_hint, tgt_hint, src_enc, tgt_enc, mode, session_ids, copy=False) -> None:
         result = migrate_sessions(
+            copy=copy,
             source_path=src_hint,
             target_path=tgt_hint,
             mode=mode,
@@ -461,7 +468,7 @@ class MigratePane(Container):
             target_encoded=tgt_enc,
             session_ids=session_ids,
         )
-        self.app.call_from_thread(self._show_result, result)
+        self.app.call_from_thread(self._show_result, result, copy)
 
     def refresh_data(self) -> None:
         """Reload project trees and the session list for the current source."""
@@ -478,7 +485,7 @@ class MigratePane(Container):
         else:
             header.update("[dim]Select a source project to see sessions[/]")
 
-    def _show_result(self, result) -> None:
+    def _show_result(self, result, copy: bool = False) -> None:
         result_widget = self.query_one("#migrate-result", Static)
         if result.success:
             skipped = (
@@ -487,8 +494,8 @@ class MigratePane(Container):
             )
             result_widget.update(
                 f"[green]{t('mig.complete')}[/]\n"
-                f"Sessions copied: {result.sessions_copied}{skipped}\n"
-                f"Memory copied: {'Yes' if result.memory_copied else 'No'}\n"
+                f"Sessions {'copied' if copy else 'moved'}: {result.sessions_copied}{skipped}\n"
+                f"Memory merged: {'Yes' if result.memory_copied else 'No'}\n"
                 f"{result.message}"
             )
             self.app.notify(t("mig.complete"))

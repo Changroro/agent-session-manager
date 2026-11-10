@@ -27,6 +27,7 @@ from asm.services.claude_data import (
     get_sessions,
     load_claude_json,
     remove_project_from_json,
+    project_paths_for_encoded,
 )
 from asm.i18n import t
 from asm.services.cleaner import trash_sessions, trash_single_session_file
@@ -124,6 +125,7 @@ class ProjectsPane(Container):
         self._all_duplicates: dict[str, list[str]] = {}
         self._codex_paths: set[str] = set()
         self._project_costs: dict[str, float] = {}
+        self._session_counts: dict[str, int] = {}  # encoded dir -> top-level .jsonl count
         self._empty_sessions: list[dict] = []
         self._filter_query = ""
         self._sort_mode = "path"
@@ -140,6 +142,8 @@ class ProjectsPane(Container):
         #    by cwd, loaded straight from their rollout paths.
         # The generation counter discards results of superseded queries.
         self._content_claude_ids: set[str] | None = None
+        self._content_main_ids: set[str] = set()  # hit in the session's own transcript
+        self._subagent_only: set[str] = set()  # shown with a (sub-agent) marker
         self._content_codex_by_cwd: dict[str, list] = {}
         self._content_search_gen = 0
         self._content_search_timer = None
@@ -147,7 +151,8 @@ class ProjectsPane(Container):
     def on_mount(self) -> None:
         tree = self.query_one("#project-tree", Tree)
         tree.show_root = False
-        self.refresh_data()
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.refresh_data()
 
     def refresh_data(self) -> None:
         self.run_worker(self._load_projects, thread=True)
@@ -169,38 +174,68 @@ class ProjectsPane(Container):
                 if cp.path not in claude_paths:
                     projects.append(cp)
         empty_sessions = find_empty_sessions()
-        project_costs = get_project_cost_map()
-        if codex_data.is_available():
-            for cwd, cost in codex_data.get_project_cost_map().items():
-                project_costs[cwd] = project_costs.get(cwd, 0.0) + cost
+        session_counts = {
+            d.name: sum(1 for _ in d.glob("*.jsonl"))
+            for d in (PROJECTS_DIR.iterdir() if PROJECTS_DIR.exists() else [])
+            if d.is_dir()
+        }
         if self.app.target_path:
             projects = [p for p in projects if p.path == self.app.target_path]
             orphaned_sessions = []
             duplicates = {}
             codex_paths = {p for p in codex_paths if p == self.app.target_path}
             empty_sessions = []
+        # Show the tree (and start the title index) before the slower cost pass.
         self.app.call_from_thread(
             self._set_project_data, projects, orphaned_sessions, duplicates, codex_paths,
-            empty_sessions, project_costs,
+            empty_sessions, {}, session_counts,
         )
+        project_costs = get_project_cost_map()
+        if codex_data.is_available():
+            for cwd, cost in codex_data.get_project_cost_map().items():
+                project_costs[cwd] = project_costs.get(cwd, 0.0) + cost
+        self.app.call_from_thread(self._set_project_costs, project_costs)
+
+    def _set_project_costs(self, project_costs: dict[str, float]) -> None:
+        self._project_costs = project_costs
+        self._build_tree_from_state()
 
     def _set_project_data(self, projects, orphaned_sessions, duplicates=None, codex_paths=None,
-                          empty_sessions=None, project_costs=None) -> None:
+                          empty_sessions=None, project_costs=None, session_counts=None) -> None:
         self._all_projects = projects
         self._all_orphaned_sessions = orphaned_sessions or []
         self._all_duplicates = duplicates or {}
         self._codex_paths = codex_paths or set()
         self._empty_sessions = empty_sessions or []
         self._project_costs = project_costs or {}
+        self._session_counts = session_counts or {}
         self._session_cache = None
         self._session_cache_gen += 1
+        if self._content_search_timer is not None:
+            self._content_search_timer.stop()
+            self._content_search_timer = None
+        self._content_search_gen += 1
+        self._content_claude_ids = None
+        self._content_main_ids = set()
+        self._content_codex_by_cwd = {}
+        if self._filter_query:
+            self._schedule_content_search()
         self._build_tree_from_state()
+        # Build the title index now, so the first keystroke already has matches.
+        self._ensure_session_cache()
+
+    def _ensure_session_cache(self) -> None:
+        if self._session_cache is None and not self._session_cache_building:
+            self._session_cache_building = True
+            gen = self._session_cache_gen
+            self.run_worker(lambda: self._build_session_cache(gen), thread=True)
 
     def _build_tree_from_state(self) -> None:
         projects = list(self._all_projects)
         orphaned_sessions = list(self._all_orphaned_sessions)
         query = self._filter_query.casefold()
         self._session_match_map = {}
+        self._subagent_only = set()
 
         if query:
             session_matches = self._match_sessions_by_title(query)
@@ -244,10 +279,7 @@ class ProjectsPane(Container):
         rebuilt once the cache lands.
         """
         if self._session_cache is None:
-            if not self._session_cache_building:
-                self._session_cache_building = True
-                gen = self._session_cache_gen
-                self.run_worker(lambda: self._build_session_cache(gen), thread=True)
+            self._ensure_session_cache()
             return {}
         # Codex body matches are folded in by _build_tree_from_state (they may
         # not be present in the title cache), so here we only match
@@ -265,6 +297,8 @@ class ProjectsPane(Container):
                     hit.append(ts)
                 elif source == "claude" and claude_ids and s.session_id in claude_ids:
                     hit.append(ts)
+                    if s.session_id not in self._content_main_ids:
+                        self._subagent_only.add(s.session_id)
             if hit:
                 matches[path] = hit
         return matches
@@ -298,9 +332,8 @@ class ProjectsPane(Container):
         self._session_cache_building = False
         if gen != self._session_cache_gen:
             # Data was refreshed while scanning: this cache reflects the old
-            # project list. Drop it; rebuilding the tree retriggers a fresh scan.
-            if self._filter_query:
-                self._build_tree_from_state()
+            # project list. Drop it and scan the new one.
+            self._ensure_session_cache()
             return
         self._session_cache = cache
         if self._filter_query:
@@ -317,33 +350,72 @@ class ProjectsPane(Container):
             self._content_search_timer.stop()
             self._content_search_timer = None
         query = self._filter_query
+        self._content_search_gen += 1  # also cancels a scan still running for the old query
         if not query:
             return
-        self._content_search_gen += 1
         gen = self._content_search_gen
         self._content_search_timer = self.set_timer(
-            0.3,
+            0.15,
             lambda: self.run_worker(lambda: self._run_content_search(query, gen), thread=True),
         )
 
     def _run_content_search(self, query: str, gen: int) -> None:
+        """Stream body hits into the tree as they are found (~10 updates/s).
+
+        A newer query bumps the generation, which makes the iterators kill
+        their ripgrep process instead of finishing a stale scan.
+        """
+        import time
+
         from asm.services import codex_data, search
 
-        claude_ids = search.search_claude_session_ids(query)
-        # Codex rollouts are global; load every body match straight from disk so
-        # hits appear even for long-dead working dirs, then group by cwd.
-        codex_paths = search.search_codex_rollout_paths(query)
-        codex_by_cwd: dict[str, list] = {}
-        if codex_paths:
-            for s in codex_data.get_sessions_by_paths(codex_paths):
-                codex_by_cwd.setdefault(s.cwd, []).append((s, "codex"))
-        self.app.call_from_thread(self._on_content_search_ready, claude_ids, codex_by_cwd, gen)
+        def cancelled() -> bool:
+            return gen != self._content_search_gen
 
-    def _on_content_search_ready(self, claude_ids: set[str], codex_by_cwd: dict[str, list], gen: int) -> None:
+        claude_hits: set[tuple[str, bool]] = set()
+        codex_paths: list[str] = []
+        last = time.monotonic()
+
+        def flush(force: bool = False) -> None:
+            nonlocal last
+            if not (claude_hits or codex_paths) or cancelled():
+                return
+            if not force and time.monotonic() - last < 0.1:
+                return
+            codex_by_cwd: dict[str, list] = {}
+            if codex_paths:
+                for s in codex_data.get_sessions_by_paths(codex_paths):
+                    codex_by_cwd.setdefault(s.cwd, []).append((s, "codex"))
+            self.app.call_from_thread(self._on_content_batch, set(claude_hits), codex_by_cwd, gen)
+            claude_hits.clear()
+            codex_paths.clear()
+            last = time.monotonic()
+
+        try:
+            for hit in search.iter_claude_hits(query, cancelled):
+                claude_hits.add(hit)
+                flush()
+            # Codex rollouts are global; matches load straight from disk so hits
+            # appear even for long-dead working dirs.
+            for path in search.iter_codex_rollout_paths(query, cancelled):
+                codex_paths.append(path)
+                flush()
+            flush(force=True)
+            self.app.call_from_thread(self._on_content_batch, set(), {}, gen)
+        except (search.SearchError, codex_data.CodexDataError, ValueError) as exc:
+            if not cancelled():
+                self.app.call_from_thread(self.app.notify, str(exc), severity="error")
+
+    def _on_content_batch(self, claude_hits: set[tuple[str, bool]], codex_by_cwd: dict[str, list], gen: int) -> None:
         if gen != self._content_search_gen:
             return  # a newer query superseded this scan
-        self._content_claude_ids = claude_ids
-        self._content_codex_by_cwd = codex_by_cwd
+        merged = self._content_claude_ids or set()
+        if not claude_hits and not codex_by_cwd and self._content_claude_ids is not None:
+            return  # end-of-scan marker with nothing new
+        self._content_claude_ids = merged | {sid for sid, _sub in claude_hits}
+        self._content_main_ids |= {sid for sid, sub in claude_hits if not sub}
+        for cwd, tagged in codex_by_cwd.items():
+            self._content_codex_by_cwd.setdefault(cwd, []).extend(tagged)
         if self._filter_query:
             self._build_tree_from_state()
 
@@ -428,6 +500,9 @@ class ProjectsPane(Container):
         path = getattr(self, "_selected_project_path", None)
         if path:
             encoded = encode_path(path)
+            if len(project_paths_for_encoded(encoded)) > 1:
+                self._render_detail_actions()
+                return
             sd = PROJECTS_DIR / encoded
             session_count = len(list(sd.glob("*.jsonl"))) if sd.exists() else 0
             self._render_detail_actions(
@@ -442,6 +517,7 @@ class ProjectsPane(Container):
             actions.append(("trash-session", t("proj.btn_trash_session"), "#e8890c"))
         if show_move:  # Codex: re-assign session to another working dir
             actions.append(("move-codex-session", t("proj.btn_move_codex"), "#8B5CF6"))
+            actions.append(("copy-codex-session", t("proj.btn_copy_codex"), "#0178d4"))
         # Per-project instruction files (edit existing, "+" to create).
         if instr_path:
             for fname in INSTRUCTION_FILES:
@@ -523,8 +599,12 @@ class ProjectsPane(Container):
         """Add a project node that can be expanded to show sessions."""
         status = "[green]O[/]" if p.exists else "[red]X[/]"
         encoded = encode_path(p.path)
-        session_dir = PROJECTS_DIR / encoded
-        session_count = len(list(session_dir.glob("*.jsonl"))) if session_dir.exists() else 0
+        ambiguous = project_paths_for_encoded(encoded)
+        if len(ambiguous) > 1:
+            label = f"[yellow]ambiguous[/] {display_name}"
+            parent.add_leaf(label, data=("project", p.path))
+            return
+        session_count = self._session_counts.get(encoded, 0)
         matched_sessions = self._session_match_map.get(p.path)
         # A full-text body search can surface Codex sessions for a working dir
         # that isn't in the recent-scan project list, so treat any matched-but-
@@ -592,7 +672,8 @@ class ProjectsPane(Container):
             size_kb = s.file_size / 1024
             summary = s.summary.replace("\n", " ")[:50] if s.summary else s.session_id[:12]
             tag = "[#D97757]C[/]" if source == "claude" else "[#10A37F]X[/]"
-            label = f"{tag} [dim]{dt}[/]  [cyan]{summary}[/]  [dim]({size_kb:.0f}KB)[/]"
+            sub = "  [magenta](sub-agent)[/]" if source == "claude" and s.session_id in self._subagent_only else ""
+            label = f"{tag} [dim]{dt}[/]  [cyan]{escape(summary)}[/]{sub}  [dim]({size_kb:.0f}KB)[/]"
             node.add_leaf(label, data=("session", s.session_id, s.project_dir, source))
 
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
@@ -607,6 +688,12 @@ class ProjectsPane(Container):
             self._selected_session = None
             self._selected_session_node = None
             encoded = encode_path(path)
+            if len(project_paths_for_encoded(encoded)) > 1:
+                self._render_detail_actions()
+                p = self._project_map.get(path)
+                if p:
+                    self._show_project_detail(p, 0)
+                return
             session_dir = PROJECTS_DIR / encoded
             session_count = len(list(session_dir.glob("*.jsonl"))) if session_dir.exists() else 0
             self._render_detail_actions(
@@ -744,9 +831,9 @@ class ProjectsPane(Container):
 
         if source == "codex":
             from asm.services import codex_data
-            messages = codex_data.get_session_messages(session_id, project_dir, limit=100_000)
+            messages = codex_data.get_session_messages(session_id, project_dir, limit=0)
         else:
-            messages = get_session_messages(session_id, project_dir=project_dir, limit=100_000)
+            messages = get_session_messages(session_id, project_dir=project_dir, limit=0)
         if not messages:
             self.app.call_from_thread(self.app.notify, t("proj.no_messages"), severity="warning")
             return
@@ -755,6 +842,10 @@ class ProjectsPane(Container):
             out_dir = Path.home()
         stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
         out = out_dir / f"asm-session-{session_id[:8]}-{stamp}.md"
+        counter = 1
+        while out.exists():
+            out = out_dir / f"asm-session-{session_id[:8]}-{stamp}_{counter}.md"
+            counter += 1
         lines = [f"# Session {session_id}", f"_source: {source} · exported by asm_", ""]
         role_names = {"user": "User", "assistant": "Assistant", "meta": "Meta"}
         for m in messages:
@@ -762,7 +853,9 @@ class ProjectsPane(Container):
             lines.append(m.get("content", ""))
             lines.append("")
         try:
-            out.write_text("\n".join(lines))
+            tmp = out.with_name(f".{out.name}.tmp")
+            tmp.write_text("\n".join(lines), encoding="utf-8")
+            tmp.replace(out)
         except OSError as exc:
             self.app.call_from_thread(self.app.notify, str(exc), severity="error")
             return
@@ -817,18 +910,19 @@ class ProjectsPane(Container):
         self._handle_action("remove-config")
 
     def _handle_action(self, action_id: str) -> None:
-        if action_id == "move-codex-session":
+        if action_id in ("move-codex-session", "copy-codex-session"):
             session = getattr(self, "_selected_session", None)
             if not session or len(session) < 3 or session[2] != "codex":
                 return
             from asm.screens.input_dialog import InputDialog
+            kind = "copy" if action_id.startswith("copy") else "move"
             self.app.push_screen(
                 InputDialog(
-                    t("proj.move_codex_title"),
-                    t("proj.move_codex_label"),
+                    t(f"proj.{kind}_codex_title"),
+                    t(f"proj.{kind}_codex_label"),
                     placeholder="/home/you/project",
                 ),
-                callback=self._do_move_codex,
+                callback=self._do_copy_codex if kind == "copy" else self._do_move_codex,
             )
             return
         if action_id.startswith("edit::"):
@@ -911,9 +1005,34 @@ class ProjectsPane(Container):
 
         def _work():
             from asm.services import codex_data
-            ok = codex_data.move_session(rollout_path, new_cwd)
+            from asm.services.live import LiveSessionError
+            try:
+                ok = codex_data.move_session(rollout_path, new_cwd)
+            except LiveSessionError as exc:
+                self.app.call_from_thread(self.app.notify, str(exc), severity="error")
+                return
             self.app.call_from_thread(self._on_codex_moved, ok)
         self.run_worker(_work, thread=True)
+
+    def _do_copy_codex(self, new_cwd: str | None) -> None:
+        new_cwd = (new_cwd or "").strip()
+        session = getattr(self, "_selected_session", None)
+        if not new_cwd or not session:
+            return
+        rollout_path = session[1]
+
+        def _work():
+            from asm.services import codex_data
+            new_id = codex_data.copy_session(rollout_path, new_cwd)
+            self.app.call_from_thread(self._on_codex_copied, new_id)
+        self.run_worker(_work, thread=True)
+
+    def _on_codex_copied(self, new_id: str | None) -> None:
+        if new_id:
+            self.app.notify(t("proj.copy_codex_ok", sid=new_id[:8]))
+            self.refresh_data()
+        else:
+            self.app.notify(t("common.failed"), severity="error")
 
     def _on_codex_moved(self, ok: bool) -> None:
         if ok:
@@ -955,7 +1074,12 @@ class ProjectsPane(Container):
 
     def _do_remove_config(self, path: str) -> None:
         def _work():
-            create_config_backup()
+            backup_path = create_config_backup()
+            from asm.services import backup
+
+            if backup.CLAUDE_JSON.exists() and not backup_path:
+                self.app.call_from_thread(self.app.notify, t("proj.config_fail"), severity="error")
+                return
             if remove_project_from_json(path):
                 self.app.call_from_thread(self.app.notify, t("proj.config_removed", path=path))
                 self.app.call_from_thread(self.refresh_data)
@@ -978,6 +1102,7 @@ class ProjectsPane(Container):
         # Drop stale body-scan results and re-arm the debounced full-text search.
         # Titles still match instantly; body matches fold in when the scan lands.
         self._content_claude_ids = None
+        self._content_main_ids = set()
         self._content_codex_by_cwd = {}
         self._schedule_content_search()
         self._build_tree_from_state()

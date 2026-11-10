@@ -51,6 +51,8 @@ def test_projects_trash_orphaned_sessions_flow(monkeypatch, tmp_path: Path):
     (orphan_dir / "dead.jsonl").write_text("{}\n")
 
     async def body(app, pilot):
+        app.action_tab("tab-projects")  # panes load on first view
+        await _settle(pilot)
         pane = app.query_one("ProjectsPane")
         assert "-home-me-orphan" in pane._orphaned_session_dirs
         pane.action_trash_orphaned()
@@ -69,6 +71,8 @@ def test_projects_remove_config_flow(monkeypatch, tmp_path: Path):
     cfg_path.write_text(json.dumps(cfg))
 
     async def body(app, pilot):
+        app.action_tab("tab-projects")  # panes load on first view
+        await _settle(pilot)
         pane = app.query_one("ProjectsPane")
         pane._selected_project_path = ghost
         pane._handle_action("remove-config")
@@ -84,6 +88,8 @@ def test_projects_clean_empty_sessions_flow(monkeypatch, tmp_path: Path):
     stub.write_text(json.dumps({"type": "ai-title", "aiTitle": "stub only"}) + "\n")
 
     async def body(app, pilot):
+        app.action_tab("tab-projects")  # panes load on first view
+        await _settle(pilot)
         pane = app.query_one("ProjectsPane")
         assert any(e["session_id"].startswith("deadbeef") for e in pane._empty_sessions)
         pane._handle_action("trash-empty-sessions")
@@ -328,6 +334,8 @@ def test_app_target_path_filters_projects(monkeypatch, tmp_path: Path):
     env = _setup_fake_claude(monkeypatch, tmp_path)
 
     async def body(app, pilot):
+        app.action_tab("tab-projects")  # panes load on first view
+        await _settle(pilot)
         pane = app.query_one("ProjectsPane")
         assert {p.path for p in pane._all_projects} == {env["project_a"]}
 
@@ -359,3 +367,16 @@ def test_app_runs_in_korean(monkeypatch, tmp_path: Path):
         _run_app(body)
     finally:
         i18n.init_lang("en")
+
+
+def test_hidden_tabs_load_only_when_first_shown(monkeypatch, tmp_path: Path):
+    _setup_fake_claude(monkeypatch, tmp_path)
+
+    async def body(app, pilot):
+        pane = app.query_one("ProjectsPane")
+        assert pane._all_projects == []  # not loaded while hidden
+        app.action_tab("tab-projects")
+        await _settle(pilot)
+        assert pane._all_projects
+
+    _run_app(body)

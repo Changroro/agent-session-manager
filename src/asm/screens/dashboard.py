@@ -169,7 +169,8 @@ class DashboardPane(Container):
             pt.zebra_stripes = True
             pt.show_cursor = False
             pt.add_columns("Period", "Cost", "", "Messages", "Input", "Output", "Cache")
-        self.refresh_data()
+        if not getattr(self.app, "lazy_tabs", False):  # main app loads tabs on first view
+            self.refresh_data()
 
     def refresh_data(self) -> None:
         self._raw_periods = {}

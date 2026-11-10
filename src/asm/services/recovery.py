@@ -12,6 +12,7 @@ from pathlib import Path
 from send2trash import send2trash
 
 from asm.models import CLAUDE_DIR, RECOVERY_BASE_DIR, RecoveryInfo
+from asm.utils import strict_child, validate_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -21,24 +22,55 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 # ~/.asm/recovery without bound (every trash duplicates data here + OS trash).
 _MAX_ITEMS = 100
 _MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+_DEFAULT_CLAUDE_DIR = CLAUDE_DIR
+_DEFAULT_RECOVERY_BASE_DIR = RECOVERY_BASE_DIR
+
+
+def _claude_root() -> Path:
+    if CLAUDE_DIR == _DEFAULT_CLAUDE_DIR:
+        from asm import models
+
+        return models.CLAUDE_DIR
+    return CLAUDE_DIR
+
+
+def _recovery_base() -> Path:
+    if RECOVERY_BASE_DIR == _DEFAULT_RECOVERY_BASE_DIR:
+        from asm import models
+
+        return models.APP_DATA_DIR / "recovery"
+    return RECOVERY_BASE_DIR
 
 
 def _validate_original_path(path: Path) -> Path:
     from asm.services import codex_data
 
-    resolved = path.resolve()
-    codex_roots = [d.parent.resolve() for d in codex_data._session_dirs() if d.parent.exists()]
-    roots = (CLAUDE_DIR.resolve(), *codex_roots)
-    if not any(resolved.is_relative_to(root) for root in roots):
+    roots = (_claude_root().resolve(), codex_data.CODEX_SESSIONS_DIR.parent.resolve())
+    lexical = path.absolute()
+    if not any(
+        lexical != root and lexical.is_relative_to(root)
+        for root in (root.absolute() for root in roots)
+    ):
         raise ValueError(f"Recovery path outside managed data dirs: {path}")
-    return resolved
+    if path.is_symlink():
+        resolved = path.resolve()
+        if not any(
+            resolved != root and resolved.is_relative_to(root) for root in roots
+        ):
+            raise ValueError(f"Recovery symlink target outside managed data dirs: {path}")
+        return path
+    for root in roots:
+        try:
+            return strict_child(path, root)
+        except ValueError:
+            continue
+    raise ValueError(f"Recovery path outside managed data dirs: {path}")
 
 
 def _recovery_root(item_id: str) -> Path:
-    root = (RECOVERY_BASE_DIR / item_id).resolve()
-    if not root.is_relative_to(RECOVERY_BASE_DIR.resolve()):
-        raise ValueError(f"Recovery item outside recovery dir: {item_id}")
-    return root
+    validate_identifier(item_id, "recovery id")
+    base = _recovery_base()
+    return strict_child(base / item_id, base)
 
 
 def _payload_size(path: Path) -> int:
@@ -59,29 +91,28 @@ def _safe_name(name: str) -> str:
 
 def create_recovery_snapshot(path: Path, category: str) -> str | None:
     """Create a recovery snapshot before the item is trashed."""
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return None
 
     try:
         original = _validate_original_path(path)
-        RECOVERY_BASE_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            RECOVERY_BASE_DIR.chmod(0o700)  # may hold session transcripts
-        except OSError:
-            pass
+        base = _recovery_base()
+        base.mkdir(parents=True, exist_ok=True)
+        base.chmod(0o700)
 
         item_id = f"{datetime.now():%Y%m%d-%H%M%S-%f}-{_safe_name(original.name)}"
-        item_root = RECOVERY_BASE_DIR / item_id
+        item_root = base / item_id
         payload_root = item_root / "payload"
         payload_root.mkdir(parents=True, exist_ok=True)
 
         snapshot = payload_root / original.name
-        if original.is_dir():
+        if original.is_symlink():
+            snapshot.symlink_to(original.readlink())
+        elif original.is_dir():
             shutil.copytree(
                 str(original),
                 str(snapshot),
                 symlinks=True,
-                ignore_dangling_symlinks=True,
             )
         else:
             shutil.copy2(str(original), str(snapshot), follow_symlinks=False)
@@ -95,22 +126,27 @@ def create_recovery_snapshot(path: Path, category: str) -> str | None:
             "created": datetime.now().timestamp(),
             "size_bytes": _payload_size(snapshot),
         }
-        (item_root / "metadata.json").write_text(
+        metadata_path = item_root / "metadata.json"
+        metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2)
         )
-        _prune_snapshots()
+        item_root.chmod(0o700)
+        metadata_path.chmod(0o600)
+        if not _prune_snapshots():
+            raise OSError("recovery retention could not be enforced")
         return item_id
     except (OSError, ValueError, shutil.Error) as exc:
         logger.warning("Failed to create recovery snapshot for %s: %s", path, exc)
         return None
 
 
-def _prune_snapshots() -> None:
+def _prune_snapshots() -> bool:
     """Drop oldest snapshots beyond the item-count or total-size cap."""
     try:
-        items = [d for d in RECOVERY_BASE_DIR.iterdir() if d.is_dir()]
+        base = _recovery_base()
+        items = [d for d in base.iterdir() if d.is_dir() and not d.is_symlink()]
     except OSError:
-        return
+        return False
     items.sort(key=lambda d: d.name)  # timestamp-prefixed → chronological
     sizes = {d: _payload_size(d) for d in items}
     total = sum(sizes.values())
@@ -119,20 +155,23 @@ def _prune_snapshots() -> None:
         victim = items.pop(0)
         total -= sizes.get(victim, 0)
         try:
-            shutil.rmtree(victim, ignore_errors=True)
-        except OSError:
-            pass
+            shutil.rmtree(victim)
+        except OSError as exc:
+            logger.warning("Failed to prune recovery snapshot %s: %s", victim, exc)
+            return False
+    return True
 
 
 def list_recovery_items() -> list[RecoveryInfo]:
     """List app-managed recovery snapshots."""
-    if not RECOVERY_BASE_DIR.exists():
+    base = _recovery_base()
+    if not base.exists():
         return []
 
     result: list[RecoveryInfo] = []
     try:
-        for item_root in sorted(RECOVERY_BASE_DIR.iterdir(), reverse=True):
-            if not item_root.is_dir():
+        for item_root in sorted(base.iterdir(), reverse=True):
+            if item_root.is_symlink() or not item_root.is_dir():
                 continue
             meta_path = item_root / "metadata.json"
             if not meta_path.exists():
@@ -164,31 +203,74 @@ def restore_recovery_item(item_id: str, overwrite: bool = False) -> tuple[bool, 
     try:
         item_root = _recovery_root(item_id)
         data = json.loads((item_root / "metadata.json").read_text())
+        if not isinstance(data, dict) or data.get("id") != item_id:
+            return False, "Recovery metadata identity mismatch"
         original = _validate_original_path(Path(data["original_path"]))
         # Trust boundary: the snapshot source must live under the recovery dir,
         # so a tampered metadata.json can't copy an arbitrary file into a managed
         # location (CWE-22/502).
         snapshot = Path(data["snapshot_path"])
-        if not snapshot.resolve().is_relative_to(RECOVERY_BASE_DIR.resolve()):
-            return False, "Snapshot path outside recovery dir"
-        if not snapshot.exists():
+        payload_root = item_root / "payload"
+        if snapshot.parent.resolve() != payload_root.resolve() or snapshot.name != original.name:
+            return False, "Snapshot path outside recovery item"
+        if not snapshot.exists() and not snapshot.is_symlink():
             return False, "Snapshot payload is missing"
 
         original.parent.mkdir(parents=True, exist_ok=True)
         if original.exists():
             if not overwrite:
                 return False, "Original path already exists"
-            send2trash(str(original))
-
-        if snapshot.is_dir():
-            shutil.copytree(
-                str(snapshot),
-                str(original),
-                symlinks=True,
-                ignore_dangling_symlinks=True,
-            )
+        stage = original.with_name(f".{original.name}.recovery-staging")
+        old = original.with_name(f".{original.name}.recovery-old")
+        if stage.exists() or stage.is_symlink():
+            if stage.is_dir() and not stage.is_symlink():
+                shutil.rmtree(stage)
+            else:
+                stage.unlink()
+        if old.exists() or old.is_symlink():
+            if old.is_dir() and not old.is_symlink():
+                shutil.rmtree(old)
+            else:
+                old.unlink()
+        if snapshot.is_symlink():
+            stage.symlink_to(snapshot.readlink())
+        elif snapshot.is_dir():
+            shutil.copytree(str(snapshot), str(stage), symlinks=True)
         else:
-            shutil.copy2(str(snapshot), str(original), follow_symlinks=False)
+            shutil.copy2(str(snapshot), str(stage), follow_symlinks=False)
+        moved_old = False
+        try:
+            if original.exists() or original.is_symlink():
+                original.rename(old)
+                moved_old = True
+            stage.rename(original)
+            if moved_old:
+                from asm.services.cleaner import record_trash
+
+                record_trash(old, "recovery-overwrite")
+                send2trash(str(old))
+        except OSError:
+            if original.exists() or original.is_symlink():
+                if original.is_dir() and not original.is_symlink():
+                    shutil.rmtree(original)
+                else:
+                    original.unlink()
+            if moved_old:
+                old.rename(original)
+            if stage.exists() or stage.is_symlink():
+                if stage.is_dir() and not stage.is_symlink():
+                    shutil.rmtree(stage)
+                else:
+                    stage.unlink()
+            raise
+        rows_file = item_root / "codex_threads.json"
+        if rows_file.exists():
+            from asm.services import codex_data
+
+            try:
+                codex_data.restore_thread_rows(json.loads(rows_file.read_text()))
+            except Exception as exc:  # the file is back; say what is missing instead of failing
+                return True, f"{original} (Codex index rows not restored: {exc})"
         return True, str(original)
     except (OSError, ValueError, KeyError, json.JSONDecodeError, shutil.Error) as exc:
         logger.warning("Failed to restore recovery item %s: %s", item_id, exc)
@@ -199,8 +281,11 @@ def delete_recovery_item(item_id: str) -> bool:
     """Delete a recovery snapshot."""
     try:
         item_root = _recovery_root(item_id)
-        if not item_root.exists():
+        if not item_root.exists() or not (item_root / "metadata.json").is_file():
             return False
+        from asm.services.cleaner import record_trash
+
+        record_trash(item_root, "recovery")
         send2trash(str(item_root))
         return True
     except (OSError, ValueError) as exc:

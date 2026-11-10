@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from send2trash import send2trash
-
 from asm.models import PROJECTS_DIR, decode_path_hint, encode_path
+from asm.utils import strict_child, validate_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class MigrateResult:
     sessions_skipped: int = 0
     memory_copied: bool = False
     message: str = ""
+    new_ids: dict[str, str] = field(default_factory=dict)  # source id -> id in the target
 
 
 def get_available_projects() -> list[tuple[str, str]]:
@@ -61,24 +63,41 @@ def migrate_sessions(
     source_encoded: str | None = None,
     target_encoded: str | None = None,
     session_ids: list[str] | None = None,
+    copy: bool = False,
 ) -> MigrateResult:
-    """Migrate sessions from source project to target project.
+    """Move (or with ``copy=True``, duplicate) sessions into the target project.
 
-    Args:
-        source_path: Absolute path of source project (for display/path updates)
-        target_path: Absolute path of target project (for display/path updates)
-        mode: "append" (keep existing, skip duplicates) or "overwrite"
-        source_encoded: Pre-encoded source dir name (avoids lossy re-encoding)
-        target_encoded: Pre-encoded target dir name (avoids lossy re-encoding)
-        session_ids: If provided, only migrate these specific session IDs.
-                     If None, migrate all sessions.
+    Each selected ``<id>.jsonl`` and its ``<id>/`` sidecar dir (subagents, tool
+    results) is staged and path-rewritten, then renamed into the target; only
+    after that are the originals trashed with recovery snapshots. Target
+    sessions not being moved are never touched. ``append`` skips ids already in
+    the target; ``overwrite`` trashes (with snapshot) and replaces them. Memory
+    files missing from the target are added. ``session_ids=None`` moves all.
+
+    ``copy`` keeps the originals and gives every copy a fresh session id (file
+    names and ``sessionId`` fields), so both can be resumed independently.
     """
+    import uuid
+
+    from asm.services import cleaner
+
+    if mode not in {"append", "overwrite"}:
+        return MigrateResult(success=False, message=f"Unknown migration mode: {mode}")
+    # Shell tab-completion appends "/", which would encode to a different dir.
+    source_path = os.path.normpath(source_path) if source_path else source_path
+    target_path = os.path.normpath(target_path) if target_path else target_path
     source_encoded = source_encoded or encode_path(source_path)
     target_encoded = target_encoded or encode_path(target_path)
-    source_dir = PROJECTS_DIR / source_encoded
-    target_dir = PROJECTS_DIR / target_encoded
+    try:
+        validate_identifier(source_encoded, "source project directory")
+        validate_identifier(target_encoded, "target project directory")
+        source_dir = strict_child(PROJECTS_DIR / source_encoded, PROJECTS_DIR)
+        target_dir = strict_child(PROJECTS_DIR / target_encoded, PROJECTS_DIR)
+    except ValueError as exc:
+        return MigrateResult(success=False, message=str(exc))
+    if source_encoded == target_encoded or source_dir == target_dir:
+        return MigrateResult(success=False, message="Source and target are the same")
 
-    # Validate source
     if not source_dir.exists():
         similar = find_similar_dirs(source_encoded)
         msg = f"Source not found: {source_dir}"
@@ -86,7 +105,6 @@ def migrate_sessions(
             msg += f"\nSimilar: {', '.join(similar)}"
         return MigrateResult(success=False, message=msg)
 
-    # Check for session files (filter by session_ids if provided)
     all_sessions = list(source_dir.glob("*.jsonl"))
     if session_ids is not None:
         id_set = set(session_ids)
@@ -95,76 +113,121 @@ def migrate_sessions(
         source_sessions = all_sessions
     if not source_sessions:
         return MigrateResult(success=False, message="No session files to migrate")
+    if any(f.is_symlink() or (source_dir / f.stem).is_symlink() for f in source_sessions):
+        return MigrateResult(success=False, message="Source contains a session symlink")
+    if not copy:  # a copy never touches the originals
+        from asm.services.live import LiveSessionError, ensure_claude_not_live
 
-    # Prepare target
-    target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            ensure_claude_not_live([f.stem for f in source_sessions], source_sessions)
+        except LiveSessionError as exc:
+            return MigrateResult(success=False, message=str(exc))
 
-    # Overwrite mode: clear existing
-    if mode == "overwrite":
-        for existing in target_dir.iterdir():
-            send2trash(str(existing))
-
-    # Copy sessions (tracking exactly which files landed in this run — only
-    # those may be path-rewritten below, or repeat runs corrupt earlier copies)
-    copied = 0
+    stage = Path(tempfile.mkdtemp(prefix=".asm-migrate-", dir=str(PROJECTS_DIR)))
+    staged: list[str] = []  # source ids staged for the target
+    id_map: dict[str, str] = {}  # source id -> id in the target (new only when copying)
+    moved: list[str] = []
     skipped = 0
-    copied_files: list[Path] = []
-    for src_file in source_sessions:
-        dest_file = target_dir / src_file.name
-        if mode == "append" and dest_file.exists():
-            skipped += 1
-            continue
-        shutil.copy2(str(src_file), str(dest_file))
-        copied += 1
-        copied_files.append(dest_file)
-
-    # Copy memory
     memory_copied = False
-    source_memory = source_dir / "memory"
-    if source_memory.exists():
-        target_memory = target_dir / "memory"
-        if mode == "overwrite" and target_memory.exists():
-            shutil.rmtree(str(target_memory))
-        if not target_memory.exists():
-            shutil.copytree(str(source_memory), str(target_memory))
-            memory_copied = True
+    try:
+        for src_file in source_sessions:
+            sid = src_file.stem
+            new_id = str(uuid.uuid4()) if copy else sid
+            if not copy and mode == "append" and (
+                (target_dir / src_file.name).exists() or (target_dir / sid).exists()
+            ):
+                skipped += 1
+                continue
+            shutil.copy2(str(src_file), str(stage / f"{new_id}.jsonl"))
+            rewrite = [stage / f"{new_id}.jsonl"]
+            if (source_dir / sid).is_dir():
+                shutil.copytree(str(source_dir / sid), str(stage / new_id), symlinks=True)
+                rewrite += sorted((stage / new_id).rglob("*.jsonl"))
+            if source_path != target_path or copy:
+                _rewrite_paths(rewrite, source_path, target_path, {sid: new_id} if copy else None)
+            staged.append(sid)
+            id_map[sid] = new_id
+
+        memory_files = _stage_missing_memory(source_dir / "memory", target_dir / "memory", stage / "memory")
+        if staged:
+            _merge_index(
+                source_dir / "sessions-index.json",
+                target_dir / "sessions-index.json",
+                stage / "sessions-index.json",
+                id_map,
+                source_path,
+                target_path,
+                target_dir,
+            )
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for sid in staged:
+            tid = id_map[sid]
+            dest_file = target_dir / f"{tid}.jsonl"
+            dest_side = target_dir / tid
+            if not copy and mode == "overwrite" and dest_file.exists():
+                if not cleaner.trash_single_session_file(target_encoded, tid):
+                    raise OSError(f"could not trash existing target session {tid}")
+            if dest_file.exists() or dest_side.exists() or dest_side.is_symlink():
+                raise OSError(f"target already has session data for {tid}: {target_dir}")
+            if (stage / tid).exists():
+                os.rename(stage / tid, dest_side)
+            os.rename(stage / f"{tid}.jsonl", dest_file)
+            moved.append(sid)
+        for rel in memory_files:
+            dest = target_dir / "memory" / rel
+            if not dest.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(stage / "memory" / rel, dest)
+                memory_copied = True
+        if (stage / "sessions-index.json").exists():
+            os.replace(stage / "sessions-index.json", target_dir / "sessions-index.json")
+
+        if copy:
+            kept = []
+            msg = f"{len(moved)} sessions copied (new ids: {', '.join(id_map[s] for s in moved)})"
         else:
-            # Append: copy only new files
-            for f in source_memory.rglob("*"):
-                if f.is_file():
-                    rel = f.relative_to(source_memory)
-                    dest = target_memory / rel
-                    if not dest.exists():
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(f), str(dest))
-                        memory_copied = True
+            kept = [sid for sid in moved if not cleaner.trash_single_session_file(source_encoded, sid)]
+            _drop_index_entries(source_dir / "sessions-index.json", set(moved) - set(kept))
+            msg = f"{len(moved)} sessions moved"
+        if skipped:
+            msg += f", {skipped} already in target (skipped)"
+        if kept:
+            msg += f"; {len(kept)} original(s) could not be trashed and remain in the source"
+        return MigrateResult(
+            success=True,
+            sessions_copied=len(moved),
+            sessions_skipped=skipped,
+            memory_copied=memory_copied,
+            message=f"{msg} ({source_path} -> {target_path})",
+            new_ids={sid: id_map[sid] for sid in moved},
+        )
+    except (OSError, ValueError, json.JSONDecodeError, shutil.Error) as exc:
+        logger.warning("Migration failed: %s", exc)
+        note = f" ({len(moved)} already moved; originals kept)" if moved else ""
+        return MigrateResult(
+            success=False, sessions_copied=len(moved), sessions_skipped=skipped, message=f"{exc}{note}"
+        )
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
 
-    # Copy sessions-index.json
-    src_index = source_dir / "sessions-index.json"
-    index_copied: Path | None = None
-    if src_index.exists():
-        dest_index = target_dir / "sessions-index.json"
-        if mode == "overwrite" or not dest_index.exists():
-            shutil.copy2(str(src_index), str(dest_index))
-            index_copied = dest_index
 
-    # Update paths in the files copied THIS run only — files from earlier runs
-    # already point at the target, and rewriting them again nests the path
-    # (source is often a prefix of target).
-    if source_path != target_path:
-        _update_paths(copied_files, index_copied, source_path, target_path,
-                      source_encoded, target_encoded)
-
-    msg = f"{copied} sessions migrated"
-    if skipped:
-        msg += f", {skipped} already in target (skipped)"
-    return MigrateResult(
-        success=True,
-        sessions_copied=copied,
-        sessions_skipped=skipped,
-        memory_copied=memory_copied,
-        message=f"{msg} ({source_path} -> {target_path})",
-    )
+def _stage_missing_memory(source: Path, target: Path, stage: Path) -> list[Path]:
+    """Copy memory files absent from ``target`` into ``stage``; return their relative paths."""
+    if not source.exists():
+        return []
+    rels = []
+    for f in source.rglob("*"):
+        if f.is_symlink():
+            raise OSError(f"Source memory contains a symlink: {f}")
+        if f.is_file():
+            rel = f.relative_to(source)
+            if not (target / rel).exists():
+                (stage / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(f), str(stage / rel))
+                rels.append(rel)
+    return rels
 
 
 _PATH_FIELDS = {"cwd", "projectPath", "path", "directory", "projectDir", "workingDirectory"}
@@ -178,9 +241,9 @@ def _replace_in_obj(obj: object, old: str, new: str, restrict_keys: bool = True)
     """
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if isinstance(v, str) and old in v:
+            if isinstance(v, str) and _path_replacement(v, old, new) != v:
                 if not restrict_keys or k in _PATH_FIELDS:
-                    obj[k] = v.replace(old, new)
+                    obj[k] = _path_replacement(v, old, new)
             elif isinstance(v, (dict, list)):
                 _replace_in_obj(v, old, new, restrict_keys)
     elif isinstance(obj, list):
@@ -189,47 +252,105 @@ def _replace_in_obj(obj: object, old: str, new: str, restrict_keys: bool = True)
                 _replace_in_obj(item, old, new, restrict_keys)
 
 
-def _update_paths(
-    copied_files: list[Path],
-    copied_index: Path | None,
+def _path_replacement(value: str, old: str, new: str) -> str:
+    if value == old:
+        return new
+    prefixes = (old + os.sep, old + "/", old + "\\")
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            return new + value[len(old):]
+    return value
+
+
+def _merge_index(
+    source: Path,
+    target: Path,
+    out: Path,
+    id_map: dict[str, str],
     source_path: str,
     target_path: str,
-    source_encoded: str,
-    target_encoded: str,
+    target_dir: Path,
 ) -> None:
-    """Update path references in the files copied by this run."""
-    # Update JSONL files - parse each line as JSON to avoid partial matches
-    for jsonl in copied_files:
-        try:
-            lines = jsonl.read_text().splitlines()
-            updated = []
-            modified = False
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    before = json.dumps(obj, ensure_ascii=False)
-                    _replace_in_obj(obj, source_path, target_path, restrict_keys=True)
-                    after = json.dumps(obj, ensure_ascii=False)
-                    updated.append(after)
-                    if before != after:
-                        modified = True
-                except json.JSONDecodeError:
-                    updated.append(line)
-            if modified:
-                jsonl.write_text("\n".join(updated) + "\n")
-        except OSError as e:
-            logger.warning("Path rewrite failed for %s: %s", jsonl.name, e)
+    """Write ``target``'s index plus entries for the sessions in ``id_map`` to ``out``."""
+    if not source.exists() and not target.exists():
+        return
+    source_data = _read_index(source) if source.exists() else {"entries": []}
+    target_data = _read_index(target) if target.exists() else {"entries": []}
+    added = []
+    for entry in source_data["entries"]:
+        new_id = id_map.get(entry.get("sessionId"))
+        if new_id is None:
+            continue
+        entry = json.loads(json.dumps(entry))
+        _replace_in_obj(entry, source_path, target_path, restrict_keys=False)
+        entry["sessionId"] = new_id
+        if "fullPath" in entry:
+            entry["fullPath"] = str(target_dir / f"{new_id}.jsonl")
+        added.append(entry)
+    new_ids = set(id_map.values())
+    entries = [e for e in target_data["entries"] if e.get("sessionId") not in new_ids] + added
+    out.write_text(json.dumps({**target_data, "entries": entries}, ensure_ascii=False, indent=2) + "\n")
 
-    # sessions-index.json - parse as JSON, not string replace
-    idx = copied_index
-    if idx is not None and idx.exists():
-        try:
-            data = json.loads(idx.read_text())
-            _replace_in_obj(data, source_path, target_path, restrict_keys=False)
-            _replace_in_obj(data, source_encoded, target_encoded, restrict_keys=False)
-            idx.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("sessions-index.json rewrite failed for %s: %s", idx, e)
+
+def _drop_index_entries(path: Path, ids: set[str]) -> None:
+    if not ids or not path.exists():
+        return
+    data = _read_index(path)
+    data["entries"] = [e for e in data["entries"] if e.get("sessionId") not in ids]
+    tmp = path.with_suffix(".json.rewrite")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_index(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid sessions index: {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("entries", []), list):
+        raise ValueError(f"Invalid sessions index: {path}")
+    entries = data.get("entries", [])
+    if any(not isinstance(entry, dict) or not entry.get("sessionId") for entry in entries):
+        raise ValueError(f"Invalid sessions index entries: {path}")
+    data["entries"] = entries
+    return data
+
+
+def _rewrite_paths(
+    files: list[Path], source_path: str, target_path: str, id_map: dict[str, str] | None = None
+) -> None:
+    """Rewrite path fields (and, when copying, session ids) in the staged JSONL copies."""
+    for jsonl in files:
+        updated = []
+        # split("\n"), not splitlines(): U+2028 etc. may appear inside JSON strings.
+        for line in jsonl.read_text(encoding="utf-8").split("\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise ValueError(f"Malformed migrated session: {jsonl}") from exc
+            if not isinstance(obj, dict):
+                raise ValueError(f"Unexpected migrated session record: {jsonl}")
+            _replace_in_obj(obj, source_path, target_path, restrict_keys=True)
+            if id_map:
+                _replace_ids(obj, id_map)
+            updated.append(json.dumps(obj, ensure_ascii=False))
+        jsonl.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+
+_ID_KEYS = {"sessionId", "session_id"}
+
+
+def _replace_ids(obj: object, id_map: dict[str, str]) -> None:
+    """Point every ``sessionId``/``session_id`` field at the copy's new id."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _ID_KEYS and isinstance(v, str) and v in id_map:
+                obj[k] = id_map[v]
+            elif isinstance(v, (dict, list)):
+                _replace_ids(v, id_map)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                _replace_ids(item, id_map)

@@ -113,3 +113,20 @@ def test_stale_cache_beats_bundled_when_offline(monkeypatch, tmp_path: Path):
     _broken_fetch(monkeypatch)
     assert pricing.load_live_rates() == "LiteLLM (stale cache, offline)"
     assert pricing.calc_cost(_MILLION_INPUT, "claude-fable-5") == 40.0
+
+
+def test_one_invalid_live_entry_keeps_the_rest(monkeypatch, tmp_path: Path):
+    _reset(monkeypatch, tmp_path)
+    _fake_fetch(monkeypatch, {
+        "claude-fable-5": {"input_cost_per_token": 2e-05, "output_cost_per_token": 1e-04},
+        "bedrock/claude-fable-latest": {"input_cost_per_token": None, "output_cost_per_token": 1e-04},
+    })
+    assert pricing.load_live_rates() == "LiteLLM (live)"
+    assert pricing.calc_cost(_MILLION_INPUT, "claude-fable-5") == 20.0
+
+
+def test_unlisted_sonnet_uses_family_rate(monkeypatch, tmp_path: Path):
+    _reset(monkeypatch, tmp_path)
+    monkeypatch.setattr(pricing, "_live_db", {})
+    assert pricing.calc_cost(_MILLION_INPUT, "claude-sonnet-5-5") == pricing.calc_cost(_MILLION_INPUT, "claude-sonnet-5")
+    assert pricing.calc_cost(_MILLION_INPUT, "claude-sonnet-4-9") == 3.0

@@ -101,7 +101,7 @@ def test_cli_cost_source_and_period_filters(monkeypatch, capsys, tmp_path: Path)
 
 def test_cli_sessions_project_filter_and_preview_json(monkeypatch, capsys, tmp_path: Path):
     env = _setup_fake_claude(monkeypatch, tmp_path)
-    code, out = _run(monkeypatch, capsys, "sessions", "--project", env["project_a"], "--json")
+    code, out = _run(monkeypatch, capsys, "find", "--project", env["project_a"], "--json")
     assert code == 0
     rows = json.loads(out)
     assert {r["session_id"] for r in rows} == {env["session_id"]}
